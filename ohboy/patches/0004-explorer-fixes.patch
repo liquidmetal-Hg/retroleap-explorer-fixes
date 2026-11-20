@@ -1,0 +1,420 @@
+diff --git a/gnuboy/loader.c b/gnuboy/loader.c
+index 2ce3470..10d0172 100644
+--- a/gnuboy/loader.c
++++ b/gnuboy/loader.c
+@@ -241,6 +241,41 @@ int rom_load()
+ 	return 0;
+ }
+ 
++/* Explorer fixes: atomic file writes (tmp + fsync + rename) so an interrupted
++ * or failed save never destroys the previous good one. */
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++int ohb_clean_exit = 0;      /* set on Quit / SIGTERM: write the auto save-state */
++
++static FILE *atomic_open(const char *final, char **tmp)
++{
++	*tmp = malloc(strlen(final) + 5);
++	sprintf(*tmp, "%s.tmp", final);
++	return fopen(*tmp, "wb");
++}
++
++static void fsync_dir_of(const char *path)
++{
++	char *d = strdup(path), *p = strrchr(d, '/');
++	int fd;
++	if (p) { *p = 0; if ((fd = open(*d ? d : "/", O_RDONLY)) >= 0) { if (fsync(fd) != 0) fprintf(stderr, "ohboy: fsync of %s failed\n", d); close(fd); } }
++	free(d);
++}
++
++/* ok = all writes succeeded; returns 0 on success, -1 (old file kept) on failure */
++static int atomic_close(FILE *f, char *tmp, const char *final, int ok)
++{
++	int rc = -1;
++	if (fflush(f) != 0) ok = 0;
++	if (ok && fsync(fileno(f)) != 0) ok = 0;
++	if (fclose(f) != 0) ok = 0;
++	if (ok && rename(tmp, final) == 0) { fsync_dir_of(final); rc = 0; }
++	else { unlink(tmp); fprintf(stderr, "ohboy: saving %s FAILED (old file kept)\n", final); }
++	free(tmp);
++	return rc;
++}
++
+ int sram_load()
+ {
+ 	FILE *f;
+@@ -267,12 +302,14 @@ int sram_save()
+ 	if (!mbc.batt || !sramfile || !ram.loaded || !mbc.ramsize)
+ 		return -1;
+ 	
+-	f = fopen(sramfile, "wb");
+-	if (!f) return -1;
+-	fwrite(ram.sbank, 8192, mbc.ramsize, f);
+-	fclose(f);
+-	
+-	return 0;
++	{
++		char *tmp;
++		int ok;
++		f = atomic_open(sramfile, &tmp);
++		if (!f) { fprintf(stderr, "ohboy: cannot create %s.tmp: %s\n", sramfile, strerror(errno)); free(tmp); return -1; }
++		ok = fwrite(ram.sbank, 8192, mbc.ramsize, f) == (size_t)mbc.ramsize;
++		return atomic_close(f, tmp, sramfile, ok);
++	}
+ }
+ 
+ 
+@@ -286,14 +323,72 @@ void state_save(int n)
+ 	name = malloc(strlen(saveprefix) + 5);
+ 	sprintf(name, "%s.%03d", saveprefix, n);
+ 
+-	if ((f = fopen(name, "wb")))
++	{
++		char *tmp;
++		if ((f = atomic_open(name, &tmp)))
++		{
++			savestate(f);
++			atomic_close(f, tmp, name, !ferror(f));
++		}
++		else free(tmp);
++	}
++	free(name);
++}
++
++/* explorer-fixes: automatic save-state written on a clean exit (Quit / power button),
++ * loaded once on the next start of the same ROM, then renamed to .aut.prev.
++ * The name contains the ROM's header and global checksum (0x14D-0x14F), so two
++ * different ROMs with the same file name never share an auto-state. */
++static char *autostate_name(const char *suffix)
++{
++	char *name;
++	if (!saveprefix || !rom.bank) return 0;
++	name = malloc(strlen(saveprefix) + 32);
++	sprintf(name, "%s.%02x%02x%02x.aut%s", saveprefix,
++		rom.bank[0][0x14d], rom.bank[0][0x14e], rom.bank[0][0x14f], suffix);
++	return name;
++}
++
++void autostate_save()
++{
++	FILE *f;
++	char *name, *tmp;
++	if (!romfile || !(name = autostate_name(""))) return;
++	if ((f = atomic_open(name, &tmp)))
+ 	{
+ 		savestate(f);
+-		fclose(f);
++		atomic_close(f, tmp, name, !ferror(f));
+ 	}
++	else free(tmp);
+ 	free(name);
+ }
+ 
++int autostate_load()
++{
++	FILE *f;
++	char *name, *prev;
++	int done = 0;
++	if (!(name = autostate_name(""))) return 0;
++	prev = autostate_name(".prev");
++	/* consume first (durably), then parse: if loading crashes, the next start won't retry it */
++	if (rename(name, prev) == 0)
++	{
++		fsync_dir_of(prev);
++		if ((f = fopen(prev, "rb")))
++		{
++			loadstate(f);
++			fclose(f);
++			vram_dirty();
++			pal_dirty();
++			sound_dirty();
++			mem_updatemap();
++			done = 1;
++		}
++	}
++	free(name); free(prev);
++	return done;
++}
++
+ 
+ void state_load(int n)
+ {
+@@ -342,10 +437,11 @@ void state_load_nosram(int n)
+ void rtc_save()
+ {
+ 	FILE *f;
+-	if (!rtc.batt) return;
+-	if (!(f = fopen(rtcfile, "wb"))) return;
++	char *tmp;
++	if (!rtc.batt || !rtcfile) return;
++	if (!(f = atomic_open(rtcfile, &tmp))) { free(tmp); return; }   /* explorer-fixes: atomic */
+ 	rtc_save_internal(f);
+-	fclose(f);
++	atomic_close(f, tmp, rtcfile, !ferror(f));
+ }
+ 
+ void rtc_load()
+@@ -393,6 +489,7 @@ static char *ldup(char *s)
+ 
+ static void cleanup()
+ {
++	if (ohb_clean_exit) autostate_save();
+ 	sram_save();
+ 	rtc_save();
+ 	/* IDEA - if error, write emergency savestate..? */
+@@ -436,7 +533,7 @@ void loader_init(char *s)
+ 	sram_load();
+ 	rtc_load();
+ 
+-	atexit(cleanup);
++	{ static int registered = 0; if (!registered) { atexit(cleanup); registered = 1; } }   /* explorer-fixes: once */
+ }
+ 
+ rcvar_t loader_exports[] =
+diff --git a/gnuboy/loader.h b/gnuboy/loader.h
+index 49e9036..e264127 100644
+--- a/gnuboy/loader.h
++++ b/gnuboy/loader.h
+@@ -19,6 +19,9 @@ void loader_unload();
+ int rom_load();
+ int sram_load();
+ int sram_save();
++void autostate_save();
++int autostate_load();
++extern int ohb_clean_exit;
+ void state_load(int n);
+ void state_save(int n);
+ void state_load_nosram(int n);
+diff --git a/gnuboy/main.c b/gnuboy/main.c
+index c606dc1..03e9915 100644
+--- a/gnuboy/main.c
++++ b/gnuboy/main.c
+@@ -116,11 +116,14 @@ static void version(char *name)
+ }
+ 
+ 
++extern volatile sig_atomic_t ohb_quit_requested;  /* explorer-fixes, main.c */
++
+ void doevents()
+ {
+ 	event_t ev;
+ 	int st;
+ 
++	if (ohb_quit_requested) { ohb_clean_exit = 1; exit(0); }
+ 	ev_poll();
+ 	while (ev_getevent(&ev))
+ 	{
+diff --git a/gnuboy/rccmds.c b/gnuboy/rccmds.c
+index e3610b0..0ed067c 100644
+--- a/gnuboy/rccmds.c
++++ b/gnuboy/rccmds.c
+@@ -72,8 +72,10 @@ static int cmd_source(int argc, char **argv)
+ 	return rc_sourcefile(argv[1]);
+ }
+ 
++extern int ohb_clean_exit;
+ static int cmd_quit()
+ {
++	ohb_clean_exit = 1;   /* explorer-fixes */
+ 	exit(0);
+ 	/* NOT REACHED */
+ }
+diff --git a/gui_sdl.c b/gui_sdl.c
+index c3274d4..6791258 100644
+--- a/gui_sdl.c
++++ b/gui_sdl.c
+@@ -1,5 +1,7 @@
+ 
+ #include <string.h>
++#include <stdlib.h>
++#include <signal.h>
+ 
+ #include <SDL/SDL.h>
+ #include "ohboy.h"
+@@ -23,9 +25,14 @@ int gui_maprgb(int r, int g, int b){
+ 	return SDL_MapRGB(screen->format,r,g,b);
+ }
+ 
++extern volatile sig_atomic_t ohb_quit_requested;  /* explorer-fixes, main.c */
++extern int ohb_clean_exit;
++
+ int gui_pollevent(guievent_t *ev){
+ 	SDL_Event event;
+ 
++	if (ohb_quit_requested) { ohb_clean_exit = 1; exit(0); }
++
+ 
+ #ifdef CAANOO
+ 
+@@ -145,10 +152,12 @@ enum
+ 		if(event.type == SDL_KEYDOWN || event.type == SDL_KEYUP){
+ 			ev->state = event.key.state == SDL_PRESSED ? GUI_PRESSED : GUI_RELEASED;
+ 			switch(event.key.keysym.sym){
+-				case SDLK_a:
++				/* explorer-fixes: same as the launcher (gmenunx) and the games: right button (B) = choose,
++				 * left button (A) = back, like a real Game Boy */
++				case SDLK_b:
+ 					ev->key = GUI_SELECT;
+ 					break;
+-				case SDLK_b:
++				case SDLK_a:
+ 					ev->key = GUI_BACK;
+ 					break;
+ 				case SDLK_UP:
+diff --git a/main.c b/main.c
+index 9cf24fb..9be5e02 100644
+--- a/main.c
++++ b/main.c
+@@ -1879,6 +1879,14 @@ void sys_initpath(char *exe)
+ }
+ 
+ void sys_checkdir(char *path, int wr) {
++	/* explorer-fixes: create the directory and its parents (was a no-op, so savedir never existed) */
++	char *p, *d;
++	if (!path || !*path) return;
++	d = strdup(path);
++	for (p = d + 1; *p; p++)
++		if (*p == '/') { *p = 0; mkdir(d, 0777); *p = '/'; }
++	mkdir(d, 0777);
++	free(d);
+ }
+ 
+ static int mapscancode(SDLKey sym)
+@@ -1916,9 +1924,9 @@ void ev_poll()
+ 				fb.enabled = event.active.gain;
+ 			break;
+ 		case SDL_KEYDOWN:
+-			if(event.key.keysym.sym==SDLK_EQUALS){
++			if(event.key.keysym.sym==SDLK_EQUALS || event.key.keysym.sym==SDLK_u){
+ 				dvolume = 1;
+-			} else if(event.key.keysym.sym==SDLK_MINUS){
++			} else if(event.key.keysym.sym==SDLK_MINUS || event.key.keysym.sym==SDLK_d){
+ 				dvolume = - 1;
+ #ifdef DINGOO_NATIVE
+ 			} else if(event.key.keysym.sym==SDLK_PAUSE){
+@@ -1973,11 +1981,13 @@ void ev_poll()
+ #endif /*GCWZERO*/
+ #endif /*DINGOO_OPENDINGUX*/
+ #ifndef DINGOO_BUILD
+-			} else if(event.key.keysym.sym==SDLK_ESCAPE){
++			} else if(event.key.keysym.sym==SDLK_ESCAPE || event.key.keysym.sym==SDLK_RETURN){
++				/* explorer-fixes: Leapster Explorer has no Escape; Home sends Enter */
+ 				dvolume = 0;
+ 				osd_persist = 0;
+ 				hw.pad = 0;
+ 				menu();
++				break;
+ 			}
+ #endif
+ 			ev.type = EV_PRESS;
+@@ -1985,10 +1995,10 @@ void ev_poll()
+ 			ev_postevent(&ev);
+ 			break;
+ 		case SDL_KEYUP:
+-			if(event.key.keysym.sym==SDLK_EQUALS){
++			if(event.key.keysym.sym==SDLK_EQUALS || event.key.keysym.sym==SDLK_u){
+ 				dvolume = 0;
+ 				osd_persist = 60;
+-			} else if(event.key.keysym.sym==SDLK_MINUS){
++			} else if(event.key.keysym.sym==SDLK_MINUS || event.key.keysym.sym==SDLK_d){
+ 				//TakeScreenShot((SDL_Surface *) NULL, (char *) NULL); /* this works in game and allows volume bar to be included in the screenshot (but takes screen shot every time volume is lowered). */
+ 				dvolume = 0;
+ 				osd_persist = 60;
+@@ -2172,8 +2182,17 @@ static int bad_signals[] =
+ 	0
+ };
+ 
++volatile sig_atomic_t ohb_quit_requested = 0;   /* explorer-fixes */
++
+ static void fatalsignal(int s)
+ {
++	if (s == SIGTERM || s == SIGINT) {
++		/* explorer-fixes: power button / shutdown. Checked once per frame in doevents()
++		 * and in the menu loop, which then exit cleanly (auto save-state + SRAM). */
++		ohb_quit_requested = 1;
++		signal(s, fatalsignal);
++		return;
++	}
+ 	die("Signal %d\n", s);
+ }
+ 
+@@ -2216,6 +2235,7 @@ void ohb_loadrom(char *rom){
+ 
+ 	loader_init(rom);
+ 	emu_reset();
++	autostate_load();   /* explorer-fixes: resume where the power button left off */
+ 	vid_init();
+ 	scaler_init(0);
+ }
+diff --git a/menu.c b/menu.c
+index 6bd1ae4..86fbbab 100644
+--- a/menu.c
++++ b/menu.c
+@@ -1,4 +1,6 @@
+ #include <stdlib.h>
++extern int ohb_clean_exit;   /* explorer-fixes, gnuboy/loader.c */
++void state_save(int n);
+ #include <stdio.h>
+ #include <dirent.h>
+ #include <string.h>
+@@ -478,10 +480,7 @@ int menu_state(int save){
+ 		name = malloc(strlen(saveprefix) + 5);
+ 		sprintf(name, "%s.%03d", saveprefix, ret-1);
+ 		if(save){
+-			if(f=fopen(name,"wb")){
+-				savestate(f);
+-				fclose(f);
+-			}
++			state_save(ret-1);   /* explorer-fixes: atomic write (tmp + fsync + rename) */
+ 		}else if(statesram==0){
+ 			if(f=fopen(name,"rb")){
+ 				loadstate_nosram(f);
+@@ -843,7 +842,8 @@ int menu_main_settings(){
+ 				file = fopen(ohboyrc,"w");
+ 				free (ohboyrc);
+ #else
+-				file = fopen("ohboy.rc","w");
++				file = fopen("/configs/.ohboy/ohboy.rc","w");   /* explorer-fixes: same path as read */
++				if (!file) file = fopen("/dev/null","w");   /* explorer-fixes: don't crash if not writable */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+ 				for(i=0; i<9; i++){
+@@ -1066,7 +1066,8 @@ int menu_video_settings(){
+ 				file = fopen(videorc,"w");
+ 				free (videorc);
+ #else
+-				file = fopen("video.rc","w");
++				file = fopen("/configs/.ohboy/video.rc","w");   /* explorer-fixes: same path as read */
++				if (!file) file = fopen("/dev/null","w");   /* explorer-fixes: don't crash if not writable */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+ 				for(i=0; i<12; i++){
+@@ -1446,14 +1447,18 @@ int menu_input_settings(){
+ 				file = fopen(bindingsrc,"w");
+ 				free (bindingsrc);
+ #else
+-				file = fopen("bindings.rc","w");
++				/* explorer-fixes: disabled on the Leapster Explorer - this build cannot serialize its key
++				 * layout, so saving would replace /configs/.ohboy/bindings.rc with a broken one. */
++				file = NULL;
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
++				if (file) {
+ 				for(i=0; i<15; i++){
+ 					fputs(config[i],file);
+ 					fputs("\n",file);
+ 				}
+ 				fclose(file);
++				}
+ 			}
+ 		break;
+ 	}
+@@ -1576,6 +1581,7 @@ int menu(){
+ 				if(menu_about()) mexit=0;
+ 				break;
+ 			case 11:
++				ohb_clean_exit = 1;   /* explorer-fixes: resume here next time */
+ 				exit(0);
+ 				break;
+ 			default:

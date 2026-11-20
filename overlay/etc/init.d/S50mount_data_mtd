@@ -1,0 +1,83 @@
+#!/bin/sh
+# Retroleap alpha10 + explorer-fixes (2026-11-19):
+#  - fixed `[ -z ${BULK_PART};` (missing ]) -> quoted test
+#  - after mounting, create /roms/saves (OhBoy saves there but nothing created it -> saves silently lost)
+#  - write /tmp/roms_mounted only when /roms is really the Bulk UBIFS, so S55start_menu can check it
+BULK_PART=`awk -e '$4 ~ /"Bulk"/ {print "/dev/" substr($1, 1, length($1)-1)}' /proc/mtd`
+MOUNT_POINT=/roms
+
+case "$1" in
+	start)
+		rm -f /tmp/roms_mounted
+
+		if grep " $MOUNT_POINT " /proc/mounts > /dev/null; then
+			echo "Data already mounted."
+			mkdir -p $MOUNT_POINT/saves && touch /tmp/roms_mounted
+			exit 0
+		fi
+
+		if [ -z "$BULK_PART" ]; then
+			echo "Bulk NAND partition not found. Probably an MMC system."
+			exit 0
+		fi
+
+		if [ ! -e $MOUNT_POINT ]; then
+			echo "Mount point $MOUNT_POINT missing."
+			exit 1
+		fi
+
+		echo "Mounting Data partition."
+
+		ubiattach /dev/ubi_ctrl -p $BULK_PART
+		if [ $? != 0 ]; then
+			echo "Attaching Data UBI failed."
+			exit 1
+		fi
+
+		mount -t ubifs -o rw ubi1_0 $MOUNT_POINT
+		if [ $? != 0 ]; then
+			echo "Mounting Data failed."
+			exit 1
+		fi
+
+		if mkdir -p $MOUNT_POINT/saves; then
+			touch /tmp/roms_mounted
+		else
+			echo "Could not create $MOUNT_POINT/saves."
+		fi
+		;;
+	stop)
+
+		echo "Unmounting Data partition."
+		sync
+
+		if grep " $MOUNT_POINT " /proc/mounts > /dev/null; then
+			umount $MOUNT_POINT
+			if [ $? != 0 ]; then
+				echo "Unmounting Data failed."
+				exit 1
+			fi
+
+			if [ -e /sys/class/ubi/ubi1 ]; then
+				ubidetach /dev/ubi_ctrl -d 1
+				if [ $? != 0 ]; then
+					echo "Detaching Data UBI failed."
+					exit 1
+				fi
+			fi
+		else
+			echo "Data not mounted."
+		fi
+		rm -f /tmp/roms_mounted
+		;;
+
+	restart)
+		$0 stop
+		$0 start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+exit 0

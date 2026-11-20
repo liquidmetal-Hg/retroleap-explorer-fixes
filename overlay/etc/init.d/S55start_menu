@@ -1,0 +1,48 @@
+#!/bin/sh
+# Retroleap alpha10 + explorer-fixes (2026-11-19):
+#  - start: warn on the console/log if /roms is not the mounted Bulk partition
+#    (games copied then land on the system partition and vanish later)
+#  - stop: stop the menu respawn loop FIRST, then ask emulators to quit (SIGTERM, so OhBoy's
+#    atexit save runs), wait up to 5 s, only then SIGKILL, then sync. Old version did
+#    `kill -9` on retroarch only and left OhBoy running until /roms was already unmounted.
+PROGS="ohboy retroarch PicoDrive PocketSNES snes9x4d gmenunx st"
+
+case "$1" in
+  start)
+    if [ -f /flags/no_menu ]; then
+      echo "No menu flag present...skipping menuing."
+      exit 0
+    fi
+    if [ ! -f /tmp/roms_mounted ]; then
+      echo "WARNING: /roms (Bulk) is NOT mounted. Do not copy games now; saves will not work." | tee /dev/console
+      logger -t start_menu "/roms not mounted"
+    fi
+    /usr/bin/respawn_menu.sh &
+    ;;
+  stop)
+    # 1. stop the loop that would restart the menu/emulators
+    for P in `pidof respawn_menu.sh` `ps | grep '[r]espawn_menu.sh' | awk '{print $1}'`; do
+      kill -9 $P 2>/dev/null
+    done
+    # 2. ask programs to quit cleanly
+    for N in $PROGS; do killall -TERM $N 2>/dev/null; done
+    # 3. wait up to 5 s for them to exit
+    i=0
+    while [ $i -lt 20 ]; do
+      left=""
+      for N in $PROGS; do pidof $N >/dev/null 2>&1 && left="$left $N"; done
+      [ -z "$left" ] && break
+      usleep 250000
+      i=$((i+1))
+    done
+    # 4. force whatever is left, then flush to flash
+    [ -n "$left" ] && { logger -t start_menu "forced kill:$left"; for N in $left; do killall -KILL $N 2>/dev/null; done; }
+    sync
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
+exit 0

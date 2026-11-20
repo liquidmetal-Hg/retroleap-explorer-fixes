@@ -1,0 +1,9 @@
+unbind enter
+bind up +up
+bind down +down
+bind left +left
+bind right +right
+bind b +a
+bind a +b
+bind p +start
+bind h +select
