@@ -78,7 +78,12 @@ The binary links against the device's own glibc 2.18, SDL 1.2 and zlib (taken fr
 - **OhBoy, offline** (chroot of the alpha10 rootfs, SDL dummy video and audio): 11/11 checks pass with a battery-backed GB game and a GBC game with 128 KB SRAM. The checks cover: save folder created, `.sav` written, auto save-state written and resumed, no save-state after a crash, a corrupt save-state not retried, and a failed write keeps the old save. **The original alpha10 binary fails 7 of the 9 save checks**, which reproduces #58.
 - **Init scripts, offline** with the image's own BusyBox: all pass, including "power press while the screen is dark = wake only" and "shutdown lets OhBoy save".
 - **On the real Explorer:** battery saves and auto-resume work, and a short power press shuts down cleanly.
-- **Not yet confirmed on the device:** the final version of the wake-from-dark-screen handling, whether the `-O3` build fixes the occasional audio stutter, and the 10-minute screen timeout over a full 10 minutes.
+- **Not yet confirmed on the device:** the final version of the wake-from-dark-screen handling, and the 10-minute screen timeout over a full 10 minutes.
+
+## Known issues
+
+- **OhBoy audio stutters at times** on the Explorer. Building with `-O3` (as upstream does) instead of `-O2` did **not** fix it. Cause not found yet.
+- A long press on Power (2 s or more) is the kernel's hard power cut; nothing is saved then.
 
 ## Credits and licence
 
