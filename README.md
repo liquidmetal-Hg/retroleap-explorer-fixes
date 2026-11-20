@@ -2,6 +2,9 @@
 
 Fixes for [Retroleap](https://github.com/mac2612/retroleap) **v2.0.0-alpha10** on the **LeapFrog Leapster Explorer (LF1000)**. Without them, Game Boy saves are lost, the power button does nothing useful, and the OhBoy menu can't be opened.
 
+> [!WARNING]
+> **Reported 2026-11-20: no sound at all** on my Explorer after installing the v0.1 `ohboy` (built with `-O3`, with Vol +/- mapped to OhBoy's volume). Being investigated. Until then, keep a copy of your original `/usr/bin/ohboy` (step 1 below) so you can put it back.
+
 **Status:** tested on **one** Leapster Explorer (factory firmware 1.3.4.2044 before flashing). Not tested on the LeapsterGS / LF2000; the LF2000 code paths are unchanged. This is a one-off share of what worked for me. There's no support and no release schedule.
 
 Background and the full bug report: [DCFUKSURMOM/retroleap#2](https://github.com/DCFUKSURMOM/retroleap/issues/2), and [mac2612/retroleap#58](https://github.com/mac2612/retroleap/issues/58) (OhBoy never saves).
@@ -82,7 +85,8 @@ The binary links against the device's own glibc 2.18, SDL 1.2 and zlib (taken fr
 
 ## Known issues
 
-- **OhBoy audio stutters at times** on the Explorer. Building with `-O3` (as upstream does) instead of `-O2` did **not** fix it. Cause not found yet.
+- **No sound at all** with the v0.1 `ohboy` on my unit (reported 2026-11-20, being investigated; see the warning at the top). Before that, with the `-O2` build, audio stuttered at times.
+- **Save files are dated 2008:** the Explorer's clock is not set, and Retroleap has no network time. Fix the clock with `date -s` over SSH.
 - A long press on Power (2 s or more) is the kernel's hard power cut; nothing is saved then.
 
 ## Credits and licence
