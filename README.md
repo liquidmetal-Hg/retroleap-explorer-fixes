@@ -2,12 +2,9 @@
 
 Fixes for [Retroleap](https://github.com/mac2612/retroleap) **v2.0.0-alpha10** on the **LeapFrog Leapster Explorer (LF1000)**. Without them, Game Boy saves are lost, the power button does nothing useful, and the OhBoy menu can't be opened.
 
-> [!WARNING]
-> **Reported 2026-11-20: no sound at all** on my Explorer after installing the v0.1 `ohboy` (built with `-O3`, with Vol +/- mapped to OhBoy's volume). Being investigated. Until then, keep a copy of your original `/usr/bin/ohboy` (step 1 below) so you can put it back.
-
 > [!NOTE]
-> **This is the `testing-s583b` branch: a newer OhBoy that is not released yet.** `main` and the v0.1 release are unchanged.
-> - **The "no sound" report above was not OhBoy.** gmenunx had set the system volume so low (40 % = about -64 dB on the CS43L22) that it was silent.
+> **v0.2 (2026-11-22): a newer OhBoy, play-tested on my Explorer.** It replaces the v0.1 binary.
+> - **The v0.1 "no sound" report was not OhBoy.** The launcher (gmenunx) had set the system volume so low that it was silent. Its percent goes straight to the CS43L22 codec at 0.5 dB per ALSA step: 40 % is about -64 dB (silent), 90 % about 0 dB, 100 % +12 dB (can distort). **Set the volume in the gmenunx menu to about 90 %**; OhBoy's Vol +/- only work within that level.
 > - **What `ohboy/patches/0005-sound-saves-speed-s583b.patch` adds** on top of 0001-0004:
 >   - a reworked sound path (locked ring buffer, no busy-wait, audio errors logged, 16-bit mixing = less hiss)
 >   - in-game saves written to flash a few seconds after the game saves
@@ -15,10 +12,10 @@ Fixes for [Retroleap](https://github.com/mac2612/retroleap) **v2.0.0-alpha10** o
 >   - MBC5/RTC fixes
 >   - stuck-button and menu fixes
 > - **It is also much faster:** a table-driven tile decoder, a faster CPU core, unchanged frames not redrawn, and plain fullscreen frames written straight to `/dev/fb0` instead of through SDL's extra copy (`OHBOY_NODIRECT=1` turns that off).
-> - **Measured on my Explorer, flat out, average of 9 games:** 9.1 ms per frame instead of 14.8 (Shantae 12.5 instead of 26.3; 16.7 ms = full speed). Picture and sound were identical to the old build in every test.
+> - **Measured on my Explorer, flat out, average of 9 games:** 9.1 ms per frame instead of 14.8 (Shantae 12.5 instead of 26.3; 16.7 ms = full speed). Picture and sound were identical to the old build in every test. Playing, Shantae no longer slows down and the sound does not stutter.
+> - **Play-tested on the device:** normal play with sound, Vol +/- and the volume bar, the Home menu (game picture behind it), Video Settings (scalers, border colour), in-game saves surviving a power-off, several games. Not tested: screenshots (the Explorer has no button for them).
 > - `OHBOY_BENCH=1 OHBOY_FRAMES=N` is a speed-test mode: no audio device, saves only in `/tmp`.
-> - **Status:** speed-tested on the device and with offline tests only. **Not yet play-tested by a person** (menus, volume bar, screenshots, a normal session with sound). Use at your own risk, and keep your old `/usr/bin/ohboy`.
-> - `./get_sources.sh && ./build.sh` in `ohboy/` builds it. The result should have sha256 `dc02550976e7515c8c139b8ce82f4b1addf0c716481e7e36d5c32a158075481a`. No prebuilt binary is attached for this branch.
+> - `./get_sources.sh && ./build.sh` in `ohboy/` builds exactly the release binary: sha256 `dc02550976e7515c8c139b8ce82f4b1addf0c716481e7e36d5c32a158075481a`.
 
 **Status:** tested on **one** Leapster Explorer (factory firmware 1.3.4.2044 before flashing). Not tested on the LeapsterGS / LF2000; the LF2000 code paths are unchanged. This is a one-off share of what worked for me. There's no support and no release schedule.
 
@@ -47,7 +44,7 @@ Each changed script has a short header saying what changed. `original-alpha10/` 
 ```
 overlay/                 changed text files, at their paths on the device
 original-alpha10/        the same files from alpha10, for comparison
-ohboy/patches/           0001-0003 = Retroleap's own OhBoy patches, 0004 = these fixes
+ohboy/patches/           0001-0003 = Retroleap's own OhBoy patches, 0004 = these fixes, 0005 = v0.2 sound/saves/speed
 ohboy/get_sources.sh     fetches OhBoy (hi-ban/ohboy @ 4720bcf) + Debian wheezy armel headers, checks sha256
 ohboy/make_sysroot.sh    builds the cross-compile sysroot (needs an unpacked alpha10 rootfs)
 ohboy/build.sh           cross-builds ohboy (Debian gcc-arm-linux-gnueabi, ARMv5TE soft-float)
@@ -100,7 +97,7 @@ The binary links against the device's own glibc 2.18, SDL 1.2 and zlib (taken fr
 
 ## Known issues
 
-- **No sound at all** with the v0.1 `ohboy` on my unit (reported 2026-11-20, being investigated; see the warning at the top). Before that, with the `-O2` build, audio stuttered at times.
+- **Quiet or no sound:** raise the volume in the gmenunx menu (about 90 %, see the note at the top). The v0.1 report of no sound at all had this cause. The audio stutter of the v0.1/-O2 builds is gone in v0.2.
 - **Save files are dated 2008:** the Explorer's clock is not set, and Retroleap has no network time. Fix the clock with `date -s` over SSH.
 - A long press on Power (2 s or more) is the kernel's hard power cut; nothing is saved then.
 
