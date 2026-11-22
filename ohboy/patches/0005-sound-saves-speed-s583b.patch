@@ -1,0 +1,1973 @@
+--- a/gnuboy/cpu.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/cpu.c	2026-11-21 16:05:21.000000000 +0100
+@@ -267,7 +267,7 @@
+ /* FIXME: employ common unit to drive whatever_advance(),
+ 	(double-speed machine cycles (2MHz) is a good candidate)
+ 	handle differences in place */
+-void div_advance(int cnt)
++static inline void div_advance_i(int cnt)
+ {
+ 	cpu.div += (cnt<<1);
+ 	if (cpu.div >= 256)
+@@ -283,7 +283,7 @@
+ /* FIXME: employ common unit to drive whatever_advance(),
+ 	(double-speed machine cycles (2MHz) is a good candidate)
+ 	handle differences in place */
+-void timer_advance(int cnt)
++static inline void timer_advance_i(int cnt)
+ {
+ 	int unit, tima;
+ 	
+@@ -307,6 +307,11 @@
+ 	}
+ }
+ 
++/* s583: the bodies above are inlined into cpu_emulate(), which runs them after every
++** instruction; these keep the old exported functions for hw.c (DMA). Same arithmetic. */
++void div_advance(int cnt) { div_advance_i(cnt); }
++void timer_advance(int cnt) { timer_advance_i(cnt); }
++
+ /* cnt - time to emulate, expressed in 2MHz units
+ 	Will call lcdc_trans() if CPU emulation catched up or
+ 	went ahead of LCDC, so that lcd never falls	behind
+@@ -324,12 +329,18 @@
+ }
+ 
+ /* cnt - time to emulate, expressed in 2MHz units */
++static inline void cpu_timers_i(int cnt)
++{
++	div_advance_i(cnt << cpu.speed);
++	timer_advance_i(cnt << cpu.speed);
++	cpu.lcdc -= cnt;
++	if (cpu.lcdc <= 0) lcdc_trans();
++	cpu.snd += cnt;
++}
++
+ void cpu_timers(int cnt)
+ {
+-	div_advance(cnt << cpu.speed);
+-	timer_advance(cnt << cpu.speed);
+-	lcdc_advance(cnt);
+-	sound_advance(cnt);
++	cpu_timers_i(cnt);
+ }
+ 
+ /* cpu_idle() 
+@@ -397,16 +408,18 @@
+ 	int i;
+ 	byte op, cbop;
+ 	int clen;
+-	static union reg acc;
+-	static byte b;
+-	static word w;
++	/* s583: were static; every use assigns them first, and locals can live in registers (Codex) */
++	union reg acc;
++	byte b;
++	word w;
+ 
+ 	i = cycles;
+ 	while(i > 0) {
+ 		/* Skip idle cycles */
+-		if ((clen = cpu_idle(i)))
++		/* s583: cpu_idle() is 0 unless halted; test that here instead of calling it every instruction */
++		if (cpu.halt && (clen = cpu_idle(i)))
+ 		{
+-			cpu_timers(clen);
++			cpu_timers_i(clen);
+ 			i -= clen;
+ 			continue;
+ 		}
+@@ -882,7 +895,7 @@
+ 
+ 		/* Advance time counters */
+ 		clen <<= 1 - cpu.speed;
+-		cpu_timers(clen);
++		cpu_timers_i(clen);
+ 
+ 		i -= clen;
+ 	} // while(i > 0)
+--- a/gnuboy/emu.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/emu.c	2026-11-21 15:57:01.000000000 +0100
+@@ -79,6 +79,51 @@
+ 		visible lines x144 = 32832 dsc (15.66ms)
+ 		vblank lines x10 = 2280 dsc (1.08ms)
+ */
++/*
++** s580: optional timing probe. Run with OHBOY_PROFILE=1 and every 300 frames stderr gets the
++** average milliseconds per frame spent in each part, the slowest frame, and how many frames
++** went over the 16.7 ms budget. Off (one branch per checkpoint) when the variable is not set.
++*/
++#include <stdlib.h>
++#include <sys/time.h>
++static int prof_on = 0, prof_frames = 0, prof_over = 0;
++static long long prof_t[7], prof_sum[7], prof_max = 0, prof_last = 0, prof_wait = 0;
++extern long long pcm_wait_us;   /* main.c: waiting for the sound card, also inside sound_mix() */
++static long long prof_now() { struct timeval tv; gettimeofday(&tv, 0); return tv.tv_sec * 1000000LL + tv.tv_usec; }
++static void prof_init()
++{
++	char *e = getenv("OHBOY_PROFILE"), *f = getenv("OHBOY_FRAMES");
++	prof_on = e && *e == '1';
++	/* s583: speed tests stop after exactly this many frames (like "set framecount"), so a test
++	** run needs no change to the config files */
++	if (f && atoi(f) > 0) framecount = atoi(f);
++}
++#define PROF(i) do { if (prof_on) prof_t[i] = prof_now(); } while (0)
++static void prof_frame()
++{
++	static const char *name[6] = { "cpu+lcd", "video out", "sound work", "waiting(idle)", "events", "vblank cpu" };
++	long long total;
++	int i;
++	if (!prof_on) return;
++	for (i = 0; i < 6; i++) prof_sum[i] += prof_t[i + 1] - prof_t[i];
++	prof_wait = pcm_wait_us;
++	if (prof_last) {
++		total = prof_t[0] - prof_last;   /* previous frame start -> this frame start */
++		if (total > prof_max) prof_max = total;
++		if (total > 16743) prof_over++;
++	}
++	prof_last = prof_t[0];
++	if (++prof_frames < 300) return;
++	/* the waits happen inside "sound mix" and "audio wait": report them as one "waiting"
++	** figure and the rest of sound mix as real work */
++	prof_sum[2] += prof_sum[3]; prof_sum[3] = prof_wait; prof_sum[2] -= prof_wait; pcm_wait_us = 0;
++	if (prof_sum[2] < 0) prof_sum[2] = 0;
++	fprintf(stderr, "ohboy prof (ms/frame, 300 frames):");
++	for (i = 0; i < 6; i++) { fprintf(stderr, " %s %.2f", name[i], prof_sum[i] / 300000.0); prof_sum[i] = 0; }
++	fprintf(stderr, " | slowest %.1f ms, over budget %d\n", prof_max / 1000.0, prof_over);
++	prof_frames = prof_over = 0; prof_max = 0;
++}
++
+ void emu_run()
+ {
+ 	void *timer = sys_timer();
+@@ -86,10 +131,11 @@
+ 
+ 	vid_begin();
+ 	//lcd_begin();
++	prof_init();
+ 	for (;;)
+ 	{
+ 		/* FRAME BEGIN */
+-		
++		PROF(0);
+ 		while (R_LY < 144)
+ 		{
+ 			/* Step through visible line scanning phase */
+@@ -97,10 +143,12 @@
+ 		}
+ 		
+ 		/* VBLANK BEGIN */
+-		
++		PROF(1);
+ 		vid_end();
++		PROF(2);
+ 		rtc_tick();
+ 		sound_mix();
++		PROF(3);
+ 		/* pcm_submit() introduces delay, if it fails we use
+ 		sys_sleep() instead */
+ 		if (!pcm_submit())
+@@ -109,14 +157,17 @@
+ 			sys_sleep(delay);
+ 			sys_elapsed(timer);
+ 		}
++		PROF(4);
+ 		doevents();
+ 		vid_begin();
+ 		if (framecount) { if (!--framecount) die("finished\n"); }
+-		
++		PROF(5);
+ 		while (R_LY > 0) {
+ 			/* Step through vblank phase */
+ 			emu_step();
+ 		}
++		PROF(6);
++		prof_frame();
+ 		/* VBLANK END */
+ 		/* FRAME END */
+ 	}
+--- a/gnuboy/events.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/events.c	2026-11-21 00:17:11.000000000 +0100
+@@ -28,6 +28,16 @@
+ 	return 1;
+ }
+ 
++/* s580: drop queued input and key states, e.g. around the in-game menu, so a press queued
++** before the menu opened can't come back afterwards without its release (stuck button) */
++void ev_clear()
++{
++	int i;
++	eventpos = eventhead;
++	for (i = 0; i < MAX_KEYS; i++) keystates[i] = 0;
++	nkeysdown = 0;
++}
++
+ int ev_getevent(event_t *ev)
+ {
+ 	if (eventpos == eventhead)
+--- a/gnuboy/fastmem.h	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/fastmem.h	2026-11-21 16:50:57.000000000 +0100
+@@ -7,17 +7,22 @@
+ #include "mem.h"
+ 
+ 
++/* s583: high RAM (0xFF80-0xFFFE, plus IE at 0xFFFF for reads) is used constantly by games
++** (stack, DMA routine, variables) but had no map entry, so every access went through
++** mem_read()/mem_write() and their chain of range tests. Same result, read straight. */
+ static byte readb(int a)
+ {
+ 	byte *p = mbc.rmap[a>>12];
+ 	if (p) return p[a];
+-	else return mem_read(a);
++	if ((unsigned)(a - 0xFF80) < 0x80) return ram.hi[a & 0xFF];
++	return mem_read(a);
+ }
+ 
+ static void writeb(int a, byte b)
+ {
+ 	byte *p = mbc.wmap[a>>12];
+ 	if (p) p[a] = b;
++	else if ((unsigned)(a - 0xFF80) < 0x7F) ram.hi[a & 0xFF] = b;
+ 	else mem_write(a, b);
+ }
+ 
+@@ -38,7 +43,10 @@
+ #endif
+ 		}
+ 	}
+-	return mem_read(a) | (mem_read(a+1)<<8);
++	if ((unsigned)(a - 0xFF80) < 0x7F)   /* s583: both bytes in high RAM / IE (stack in HRAM) */
++		return ram.hi[a & 0xFF] | (ram.hi[(a + 1) & 0xFF] << 8);
++	/* s583: a word at 0xFFFF wraps to 0x0000 (was mem_read(0x10000): a ROM byte past the bank) */
++	return mem_read(a) | (mem_read((a+1) & 0xFFFF)<<8);
+ }
+ 
+ static void writew(int a, int w)
+@@ -66,18 +74,28 @@
+ #endif
+ 		}
+ 	}
++	if ((unsigned)(a - 0xFF80) < 0x7E)   /* s583: both bytes in high RAM, not IE */
++	{
++		ram.hi[a & 0xFF] = w;
++		ram.hi[(a + 1) & 0xFF] = w >> 8;
++		return;
++	}
+ 	mem_write(a, w);
+-	mem_write(a+1, w>>8);
++	mem_write((a+1) & 0xFFFF, w>>8);   /* s583: was 0x10000, which reached the MBC as a ROM-area write */
+ }
+ 
++/* s583: LDH (0xFF00+n) with a byte-sized n: page F has no map entry, so go straight to
++** high RAM or to the IO handlers (IE writes still go through ioreg_write for masking) */
+ static byte readhi(int a)
+ {
+-	return readb(a | 0xff00);
++	if (a >= 0x80) return ram.hi[a];
++	return mem_read(0xff00 | a);
+ }
+ 
+ static void writehi(int a, byte b)
+ {
+-	writeb(a | 0xff00, b);
++	if ((unsigned)(a - 0x80) < 0x7f) ram.hi[a] = b;
++	else mem_write(0xff00 | a, b);
+ }
+ 
+ #if 0
+--- a/gnuboy/lcd.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/lcd.c	2026-11-22 00:36:09.000000000 +0100
+@@ -15,6 +15,7 @@
+ struct lcd lcd;
+ 
+ struct scan scan;
++int lcd_frame_changed = 1;
+ 
+ #define BG (scan.bg)
+ #define WND (scan.wnd)
+@@ -40,7 +41,14 @@
+ #define WT (scan.wt)
+ #define WV (scan.wv)
+ 
+-byte patpix[4096][8][8];
++/* s583: patpix rows are written as 32-bit words, so keep it aligned. patdirty[tile] is now a
++** bit mask of the tile's 8 rows that changed (was 0/1 for the whole tile), so a game that
++** streams tiles a few bytes per scanline (Shantae) only gets those rows decoded again. */
++byte patpix[2048][8][8] __attribute__((aligned(8)));
++/* s583: the y-flipped copies (tile index + 2048 / + 3072) are no longer stored (Codex chunk 7):
++** a y-flipped tile's row v is row 7 - v = v ^ 7 of the unflipped tile. Halves the 256 KiB
++** tile cache and the decoding writes. PATROW(t, v) = row v of tile index t (0-4095). */
++#define PATROW(t, v) (patpix[(t) & 2047][(v) ^ (((t) >> 11) * 7)])
+ byte patdirty[1024];
+ byte anydirty;
+ 
+@@ -98,41 +106,65 @@
+ 
+ 
+ #ifndef ASM_UPDATEPATPIX
++/*
++** s583: table decoder. One 2bpp row (low byte, high byte) becomes 8 pixel bytes (0-3).
++** dec_msb[b] holds the 8 bits of b as bytes, leftmost pixel (bit 7) first = normal tile;
++** dec_lsb[b] holds them bit 0 first = x-flipped tile. pixels = dec[lo] | dec[hi] << 1
++** (each byte is 0 or 1, so the shift never carries into the next byte). The y-flipped
++** copies (+2048, +3072) are the same rows stored upside down. Output is identical to the
++** old bit-by-bit loop.
++*/
++static un32 dec_msb[256][2], dec_lsb[256][2];
++static int dec_ready = 0;
++
++static void dec_init()
++{
++	int b, k;
++	for (b = 0; b < 256; b++)
++	{
++		byte m[8], l[8];
++		for (k = 0; k < 8; k++)
++		{
++			l[k] = (b >> k) & 1;
++			m[k] = (b >> (7 - k)) & 1;
++		}
++		memcpy(dec_msb[b], m, 8);
++		memcpy(dec_lsb[b], l, 8);
++	}
++	dec_ready = 1;
++}
++
++/* s583: tiles waiting to be decoded (Codex chunk 7). A tile is queued when its first row
++** gets dirty, so updatepatpix() no longer sweeps all 768 tile slots on every scanline. */
++static un16 dirtyq[768];
++static int dirtyqn = 0;
++
+ void updatepatpix()
+ {
+-	int i, j, k;
+-	int a, c;
+-	byte *vram = lcd.vbank[0];
+-	
++	int t, r, rows;
++
+ 	if (!anydirty) return;
+-	for (i = 0; i < 1024; i++)
++	if (!dec_ready) dec_init();
++	while (dirtyqn > 0)
+ 	{
+-		if (i == 384) i = 512;
+-		if (i == 896) break;
+-		if (!patdirty[i]) continue;
+-		patdirty[i] = 0;
+-		for (j = 0; j < 8; j++)
+-		{
+-			a = ((i<<4) | (j<<1));
+-			for (k = 0; k < 8; k++)
+-			{
+-				c = vram[a] & (1<<k) ? 1 : 0;
+-				c |= vram[a+1] & (1<<k) ? 2 : 0;
+-				patpix[i+1024][j][k] = c;
+-			}
+-			for (k = 0; k < 8; k++)
+-				patpix[i][j][k] =
+-					patpix[i+1024][j][7-k];
+-		}
+-		for (j = 0; j < 8; j++)
+-		{
+-			for (k = 0; k < 8; k++)
+-			{
+-				patpix[i+2048][j][k] =
+-					patpix[i][7-j][k];
+-				patpix[i+3072][j][k] =
+-					patpix[i+1024][7-j][k];
+-			}
++		byte *src;
++		t = dirtyq[--dirtyqn];
++		rows = patdirty[t];
++		patdirty[t] = 0;
++		src = lcd.vbank[t >> 9] + ((t & 511) << 4);
++		for (r = 0; r < 8; r++)
++		{
++			int lo, hi;
++			un32 *n, *x;
++			if (!(rows & (1 << r))) continue;
++			lo = src[r << 1];
++			hi = src[(r << 1) | 1];
++			n = (un32 *)patpix[t][r];
++			x = (un32 *)patpix[t + 1024][r];
++			n[0] = dec_msb[lo][0] | (dec_msb[hi][0] << 1);
++			n[1] = dec_msb[lo][1] | (dec_msb[hi][1] << 1);
++			x[0] = dec_lsb[lo][0] | (dec_lsb[hi][0] << 1);
++			x[1] = dec_lsb[lo][1] | (dec_lsb[hi][1] << 1);
+ 		}
+ 	}
+ 	anydirty = 0;
+@@ -250,19 +282,19 @@
+ 	tile = BG;
+ 	dest = BUF;
+ 	
+-	src = patpix[*(tile++)][V] + U;
++	src = PATROW(*tile, V) + U; tile++;
+ 	memcpy(dest, src, 8-U);
+ 	dest += 8-U;
+ 	cnt -= 8-U;
+ 	if (cnt <= 0) return;
+ 	while (cnt >= 8)
+ 	{
+-		src = patpix[*(tile++)][V];
++		src = PATROW(*tile, V); tile++;
+ 		MEMCPY8(dest, src);
+ 		dest += 8;
+ 		cnt -= 8;
+ 	}
+-	src = patpix[*tile][V];
++	src = PATROW(*tile, V);
+ 	while (cnt--)
+ 		*(dest++) = *(src++);
+ }
+@@ -280,12 +312,12 @@
+ 	
+ 	while (cnt >= 8)
+ 	{
+-		src = patpix[*(tile++)][WV];
++		src = PATROW(*tile, WV); tile++;
+ 		MEMCPY8(dest, src);
+ 		dest += 8;
+ 		cnt -= 8;
+ 	}
+-	src = patpix[*tile][WV];
++	src = PATROW(*tile, WV);
+ 	while (cnt--)
+ 		*(dest++) = *(src++);
+ }
+@@ -369,19 +401,19 @@
+ 	tile = BG;
+ 	dest = BUF;
+ 	
+-	src = patpix[*(tile++)][V] + U;
++	src = PATROW(*tile, V) + U; tile++;
+ 	blendcpy(dest, src, *(tile++), 8-U);
+ 	dest += 8-U;
+ 	cnt -= 8-U;
+ 	if (cnt <= 0) return;
+ 	while (cnt >= 8)
+ 	{
+-		src = patpix[*(tile++)][V];
++		src = PATROW(*tile, V); tile++;
+ 		blendcpy(dest, src, *(tile++), 8);
+ 		dest += 8;
+ 		cnt -= 8;
+ 	}
+-	src = patpix[*(tile++)][V];
++	src = PATROW(*tile, V); tile++;
+ 	blendcpy(dest, src, *(tile++), cnt);
+ }
+ #endif
+@@ -399,15 +431,87 @@
+ 	
+ 	while (cnt >= 8)
+ 	{
+-		src = patpix[*(tile++)][WV];
++		src = PATROW(*tile, WV); tile++;
+ 		blendcpy(dest, src, *(tile++), 8);
+ 		dest += 8;
+ 		cnt -= 8;
+ 	}
+-	src = patpix[*(tile++)][WV];
++	src = PATROW(*tile, WV); tile++;
+ 	blendcpy(dest, src, *(tile++), cnt);
+ }
+ 
++/*
++** s583 (patch 0010): CGB background and window in one pass each, straight from the tile map and
++** attribute map. Was: tilebuf() wrote two ints per tile into scan.bg/scan.wnd, then
++** bg_scan_color()/wnd_scan_color() read them back and blended byte by byte. Tile index and palette
++** are computed exactly as in tilebuf(); a tile row (8 bytes 0-3) gets its palette offset (a
++** multiple of 4, below 32) ORed into all four bytes of a word at once. Background tiles land on
++** 8-byte boundaries (see scan.line in lcd.h), so they are two aligned word stores; whole tiles
++** are written, so bytes left of x 0 and right of WX are scratch (the window, drawn after, covers
++** WX..159; x >= 160 is never read). Pixels 0-159 are identical to the old code.
++*/
++#define CGB_TILE(tm, am, sel) ((((sel) ? (int)*(tm) : 256 + (int)(n8)*(tm)) \
++	| (((int)*(am) & 0x08) << 6) | (((int)*(am) & 0x60) << 5)))
++#define CGB_PAL(am) (((un32)*(am) & 7) * 0x04040404u)
++
++static void bg_line_cgb()
++{
++	int cnt, col, sel = R_LCDC & 0x10;
++	byte *tm, *am;
++	un32 *d, *s, p;
++
++	if (WX <= 0) return;
++	tm = lcd.vbank[0] + ((R_LCDC&0x08)?0x1C00:0x1800) + (T<<5);
++	am = lcd.vbank[1] + (tm - lcd.vbank[0]);
++	d = (un32 *)(BUF - U);
++	cnt = (U + WX + 7) >> 3;   /* tiles touching x 0..WX-1 */
++	col = S;
++	while (cnt-- > 0)
++	{
++		s = (un32 *)PATROW(CGB_TILE(tm + col, am + col, sel), V);
++		p = CGB_PAL(am + col);
++		d[0] = s[0] | p;
++		d[1] = s[1] | p;
++		d += 2;
++		col = (col + 1) & 31;
++	}
++}
++
++static void wnd_line_cgb()
++{
++	int cnt, sel = R_LCDC & 0x10;
++	byte *tm, *am, *dest;
++
++	if (WX >= 160) return;
++	tm = lcd.vbank[0] + ((R_LCDC&0x40)?0x1C00:0x1800) + (WT<<5);
++	am = lcd.vbank[1] + (tm - lcd.vbank[0]);
++	dest = BUF + WX;
++	cnt = (160 - WX + 7) >> 3;
++	if (!((unsigned long)dest & 3))
++	{
++		un32 *d = (un32 *)dest, *s, p;
++		while (cnt-- > 0)
++		{
++			s = (un32 *)PATROW(CGB_TILE(tm, am, sel), WV);
++			p = CGB_PAL(am);
++			d[0] = s[0] | p;
++			d[1] = s[1] | p;
++			d += 2; tm++; am++;
++		}
++	}
++	else
++	{
++		/* window not word aligned (WX + U not a multiple of 4): bytes */
++		while (cnt-- > 0)
++		{
++			byte *s = PATROW(CGB_TILE(tm, am, sel), WV), p = (*am & 7) << 2;
++			dest[0] = s[0] | p; dest[1] = s[1] | p; dest[2] = s[2] | p; dest[3] = s[3] | p;
++			dest[4] = s[4] | p; dest[5] = s[5] | p; dest[6] = s[6] | p; dest[7] = s[7] | p;
++			dest += 8; tm++; am++;
++		}
++	}
++}
++
+ static void recolor(byte *buf, byte fill, int cnt)
+ {
+ 	while (cnt--) *(buf++) |= fill;
+@@ -476,7 +580,7 @@
+ 			}
+ 			if (o->flags & 0x40) pat ^= 1;
+ 		}
+-		VS[NS].buf = patpix[pat][v];
++		VS[NS].buf = PATROW(pat, v);   /* s583: after the 8x16 half/flip adjustment above */
+ 		if (++NS == 10) break;
+ 	}
+ 	if (!sprsort || hw.cgb) return;
+@@ -496,7 +600,7 @@
+ 		ts[i] = VS[l];
+ 		VS[l].x = 160;
+ 	}
+-	memcpy(VS, ts, sizeof VS);
++	memcpy(VS, ts, sizeof ts);   /* s583: ts has 10 entries; sizeof VS (16) read past its end */
+ }
+ 
+ void spr_scan()
+@@ -509,7 +613,7 @@
+ 
+ 	if (!ns) return;
+ 
+-	memcpy(bgdup, BUF, 256);
++	memcpy(bgdup, BUF, 160);   /* s583: only x 0-159 is ever read below (was 256) */
+ 	vs = &VS[ns-1];
+ 	
+ 	for (; ns; ns--, vs--)
+@@ -595,7 +699,8 @@
+ 	T = Y >> 3;
+ 	U = X & 7;
+ 	V = Y & 7;
+-	
++	BUF = scan.line + 8 + U;   /* s583: background tiles 8-byte aligned, see lcd.h */
++
+ 	WX = R_WX - 7;
+ 	if (WY>L || WY<0 || WY>143 || WX<-7 || WX>159 || !(R_LCDC&0x20))
+ 		WX = 160;
+@@ -604,11 +709,10 @@
+ 
+ 	spr_enum();
+ 
+-	tilebuf();
+ 	if (hw.cgb)
+ 	{
+-		bg_scan_color();
+-		wnd_scan_color();
++		bg_line_cgb();    /* s583: replace tilebuf + bg_scan_color + wnd_scan_color */
++		wnd_line_cgb();
+ 		if (NS)
+ 		{
+ 			bg_scan_pri();
+@@ -617,17 +721,21 @@
+ 	}
+ 	else
+ 	{
++		tilebuf();
+ 		bg_scan();
+ 		wnd_scan();
+ 		recolor(BUF+WX, 0x04, 160-WX);
+ 	}
+ 	spr_scan();
+ 
+-	if (fb.dirty) memset(fb.ptr, 0, fb.pitch * fb.h);
++	if (fb.dirty) { memset(fb.ptr, 0, fb.pitch * fb.h); lcd_frame_changed = 1; }
+ 	fb.dirty = 0;
+ 	if (density > scale) density = scale;
+ 	if (scale == 1) density = 1;
+ 
++	/* s583: only refresh_2 written straight into the frame buffer reports its own changes */
++	if (density != 1 || scale > 1 || fb.pelsize != 2) lcd_frame_changed = 1;
++
+ 	dest = (density != 1) ? scalebuf : vdest;
+ 	
+ 	switch (scale)
+@@ -848,16 +956,29 @@
+ 
+ void vram_write(int a, byte b)
+ {
+-	lcd.vbank[R_VBK&1][a] = b;
++	byte *p = &lcd.vbank[R_VBK&1][a];
++	int t;
++	if (*p == b) return;   /* s583: same byte again: nothing to decode */
++	*p = b;
+ 	if (a >= 0x1800) return;
+-	patdirty[((R_VBK&1)<<9)+(a>>4)] = 1;
++	t = ((R_VBK&1)<<9)+(a>>4);
++	if (!patdirty[t]) dirtyq[dirtyqn++] = t;
++	patdirty[t] |= 1 << ((a >> 1) & 7);   /* s583: the row that changed */
+ 	anydirty = 1;
+ }
+ 
+ void vram_dirty()
+ {
++	int t;
+ 	anydirty = 1;
+-	memset(patdirty, 1, sizeof patdirty);
++	/* s583: all 8 rows of every tile (0-383 in each bank); the queue is rebuilt from scratch */
++	dirtyqn = 0;
++	for (t = 0; t < 896; t++)
++	{
++		if (t == 384) t = 512;
++		patdirty[t] = 0xFF;
++		dirtyq[dirtyqn++] = t;
++	}
+ }
+ 
+ void pal_dirty()
+--- a/gnuboy/lcd.h	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/lcd.h	2026-11-22 00:36:09.000000000 +0100
+@@ -14,10 +14,18 @@
+ {
+ 	int bg[64];
+ 	int wnd[64];
+-	byte buf[256];
++	/* s583: the line is drawn into line[]; buf points 8 + U bytes into it (set per line), so
++	** that every background tile starts on an 8-byte boundary and can be written as two 32-bit
++	** words (ARM9: no unaligned word stores). The 8 bytes in front take the U pixels of the first
++	** tile left of x 0 (and a window at WX < 0); the tail takes pixels right of x 159. */
++	byte line[8 + 256 + 16] __attribute__((aligned(8)));
++	byte *buf;
+ 	byte pal1[128];
+ 	un16 pal2[64];
+ 	un32 pal4[64];
++	/* s583 (patch 0010, Codex chunk 9): wnd_scan_pri() writes from PRI + WX, and WX can be -7..-1,
++	** which used to land in the end of pal4[]; these 8 bytes take it instead */
++	byte pripad[8];
+ 	byte pri[256];
+ 	struct vissprite vs[16];
+ 	int ns, l, x, y, s, t, u, v, wx, wy, wt, wv;
+@@ -44,6 +52,9 @@
+ 
+ extern struct lcd lcd;
+ extern struct scan scan;
++/* s583 (patch 0010): set when a scanline changed a pixel of the frame buffer (fb.ptr) since
++** vid_end() last cleared it; main.c skips drawing a frame when it stayed 0 */
++extern int lcd_frame_changed;
+ 
+ 
+ void lcd_begin();
+--- a/gnuboy/loader.c	2026-11-22 01:13:03.925263684 +0100
++++ b/gnuboy/loader.c	2026-11-21 15:58:48.000000000 +0100
+@@ -204,6 +204,7 @@
+ 	}
+ #endif /* GNUBOY_USE_MINIZIP */
+ 	header = data = decompress(data, &len);
++	if (!data || len < 0x150) die("not a Game Boy ROM (file too small or unreadable)\n");   /* s580 */
+ 	
+ 	memcpy(rom.name, header+0x0134, 16);
+ 	if (rom.name[14] & 0x80) rom.name[14] = 0;
+@@ -220,11 +221,18 @@
+ 	if (!mbc.romsize) die("unknown ROM size %02X\n", header[0x0148]);
+ 	if (!mbc.ramsize) die("unknown SRAM size %02X\n", header[0x0149]);
+ 
++	c = header[0x0143];   /* s580: read before realloc() below, which can move/free header */
++
+ 	rlen = 16384 * mbc.romsize;
+-	rom.bank = realloc(data, rlen);
++	{
++		void *nb = realloc(data, rlen);
++		if (!nb) die("out of memory for ROM (%d bytes)\n", rlen);
++		rom.bank = nb;
++	}
+ 	if (rlen > len) memset(rom.bank[0]+len, 0xff, rlen - len);
+ 	
+ 	ram.sbank = malloc(8192 * mbc.ramsize);
++	if (!ram.sbank) die("out of memory for SRAM\n");
+ 
+ 	initmem(ram.sbank, 8192 * mbc.ramsize);
+ 	initmem(ram.ibank, 4096 * 8);
+@@ -232,7 +240,6 @@
+ 	mbc.rombank = 1;
+ 	mbc.rambank = 0;
+ 
+-	c = header[0x0143];
+ 	hw.cgb = ((c == 0x80) || (c == 0xc0)) && !forcedmg;
+ 	hw.gba = (hw.cgb && gbamode);
+ 
+@@ -241,7 +248,7 @@
+ 	return 0;
+ }
+ 
+-/* Explorer fixes: atomic file writes (tmp + fsync + rename) so an interrupted
++/* s577 Explorer fixes: atomic file writes (tmp + fsync + rename) so an interrupted
+  * or failed save never destroys the previous good one. */
+ #include <unistd.h>
+ #include <fcntl.h>
+@@ -255,12 +262,16 @@
+ 	return fopen(*tmp, "wb");
+ }
+ 
+-static void fsync_dir_of(const char *path)
++static int fsync_dir_of(const char *path)   /* s580: returns 0 on success */
+ {
+ 	char *d = strdup(path), *p = strrchr(d, '/');
+-	int fd;
+-	if (p) { *p = 0; if ((fd = open(*d ? d : "/", O_RDONLY)) >= 0) { if (fsync(fd) != 0) fprintf(stderr, "ohboy: fsync of %s failed\n", d); close(fd); } }
++	const char *dir = ".";
++	int fd, rc = -1;
++	if (p) { *p = 0; dir = *d ? d : "/"; }
++	if ((fd = open(dir, O_RDONLY)) >= 0) { rc = fsync(fd); close(fd); }
++	if (rc != 0) fprintf(stderr, "ohboy: fsync of directory %s failed\n", dir);
+ 	free(d);
++	return rc;
+ }
+ 
+ /* ok = all writes succeeded; returns 0 on success, -1 (old file kept) on failure */
+@@ -270,25 +281,53 @@
+ 	if (fflush(f) != 0) ok = 0;
+ 	if (ok && fsync(fileno(f)) != 0) ok = 0;
+ 	if (fclose(f) != 0) ok = 0;
+-	if (ok && rename(tmp, final) == 0) { fsync_dir_of(final); rc = 0; }
++	if (ok && rename(tmp, final) == 0) rc = fsync_dir_of(final);   /* s580: not durable = not done */
+ 	else { unlink(tmp); fprintf(stderr, "ohboy: saving %s FAILED (old file kept)\n", final); }
+ 	free(tmp);
+ 	return rc;
+ }
+ 
++void rtc_load();
++void rtc_save();
++static int af_started, af_frames, af_busy;
++static un32 af_on_flash, af_last;
++static un32 sram_hash();
++static void af_reset() { af_frames = af_busy = 0; af_last = 0; }
++
+ int sram_load()
+ {
+ 	FILE *f;
+ 
+-	if (!mbc.batt || !sramfile || !*sramfile) return -1;
++	af_started = 0;   /* s580: baseline for sram_autoflush(), set below once SRAM holds the file */
++	af_reset();
+ 
+-	/* Consider sram loaded at this point, even if file doesn't exist */
+-	ram.loaded = 1;
++	if (!mbc.batt || !sramfile || !*sramfile) return -1;
+ 
+ 	f = fopen(sramfile, "rb");
+-	if (!f) return -1;
+-	fread(ram.sbank, 8192, mbc.ramsize, f);
++	if (!f) {
++		if (errno != ENOENT) {   /* s580: exists but unreadable: never overwrite it this session */
++			fprintf(stderr, "ohboy: cannot read %s (%s): saving disabled for this game\n", sramfile, strerror(errno));
++			ram.loaded = 0;
++			return -1;
++		}
++		ram.loaded = 1;   /* no .sav yet: the first change gets saved */
++		af_on_flash = sram_hash(); af_started = 1;
++		return -1;
++	}
++	{
++		size_t got = fread(ram.sbank, 1, 8192 * mbc.ramsize, f);
++		if (ferror(f)) {
++			fprintf(stderr, "ohboy: read error on %s: saving disabled for this game\n", sramfile);
++			fclose(f);
++			ram.loaded = 0;
++			return -1;
++		}
++		if (got < (size_t) (8192 * mbc.ramsize))
++			fprintf(stderr, "ohboy: %s is short (%u of %d bytes), rest left as is\n", sramfile, (unsigned) got, 8192 * mbc.ramsize);
++	}
+ 	fclose(f);
++	ram.loaded = 1;
++	af_on_flash = sram_hash(); af_started = 1;
+ 	
+ 	return 0;
+ }
+@@ -335,7 +374,7 @@
+ 	free(name);
+ }
+ 
+-/* explorer-fixes: automatic save-state written on a clean exit (Quit / power button),
++/* s577: automatic save-state written on a clean exit (Quit / power button),
+  * loaded once on the next start of the same ROM, then renamed to .aut.prev.
+  * The name contains the ROM's header and global checksum (0x14D-0x14F), so two
+  * different ROMs with the same file name never share an auto-state. */
+@@ -382,6 +421,10 @@
+ 			pal_dirty();
+ 			sound_dirty();
+ 			mem_updatemap();
++			/* s580: the state holds the game clock as it was at quit time; re-read .rtc,
++			** which rtc_load() advances by the real time that passed, so resuming
++			** doesn't roll an RTC game's clock back */
++			rtc_load();
+ 			done = 1;
+ 		}
+ 	}
+@@ -439,7 +482,7 @@
+ 	FILE *f;
+ 	char *tmp;
+ 	if (!rtc.batt || !rtcfile) return;
+-	if (!(f = atomic_open(rtcfile, &tmp))) { free(tmp); return; }   /* explorer-fixes: atomic */
++	if (!(f = atomic_open(rtcfile, &tmp))) { free(tmp); return; }   /* s577: atomic */
+ 	rtc_save_internal(f);
+ 	atomic_close(f, tmp, rtcfile, !ferror(f));
+ }
+@@ -487,6 +530,50 @@
+ 	return n;
+ }
+ 
++/*
++** s580: write the in-game save (.sav) soon after the game changes it, not only on quit.
++** SRAM is mapped straight into the CPU's memory map (mem.c), so writes can't be caught cheaply.
++** Instead: every ~2 s (120 frames) hash the SRAM. When it differs from what is on flash and has
++** stayed the same for one interval (the game finished saving), write .sav (atomic, fsync).
++** Games that use SRAM as scratch memory and change it constantly are written at most every ~60 s.
++** Before: .sav was written only on Quit / power-off / ROM change, so a flat battery or a hard
++** power-off (power held >= 2 s) lost every in-game save since the game was started.
++*/
++
++static un32 sram_hash()
++{
++	un32 h = 2166136261u, *p = (un32 *) ram.sbank;
++	int i, n = mbc.ramsize * 8192 / 4;
++	for (i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
++	return h;
++}
++
++void sram_autoflush()
++{
++	un32 h;
++
++	if (!mbc.batt || !sramfile || !ram.loaded || !mbc.ramsize || !ram.sbank) return;
++	if (++af_frames < 120) return;
++	af_frames = 0;
++	h = sram_hash();
++	if (!af_started) { af_on_flash = af_last = h; af_started = 1; af_busy = 0; return; }
++	if (h == af_on_flash) { af_busy = 0; af_last = h; return; }
++	if (h == af_last || ++af_busy >= 30) {
++		if (sram_save() == 0) af_on_flash = h;
++		af_busy = 0;
++	}
++	af_last = h;
++}
++
++/* s580: called when the Home menu opens: write a changed SRAM now (the game may have just
++** saved, and the menu pauses sram_autoflush()). */
++void sram_flush_now()
++{
++	if (!mbc.batt || !sramfile || !ram.loaded || !mbc.ramsize || !ram.sbank || !af_started) return;
++	if (sram_hash() != af_on_flash && sram_save() == 0) af_on_flash = sram_hash();
++	rtc_save();
++}
++
+ static void cleanup()
+ {
+ 	if (ohb_clean_exit) autostate_save();
+@@ -497,8 +584,11 @@
+ 
+ void loader_init(char *s)
+ {
+-	char *name, *p;
++	char *name, *p, *bench = getenv("OHBOY_BENCH");
+ 
++	/* s583: a speed test (OHBOY_BENCH=1) must never read or overwrite real saves: all of them
++	** (.sav, .rtc, .aut, state slots) go to a scratch folder in /tmp (RAM on the Leapster) */
++	if (bench && *bench == '1') savedir = strdup("/tmp/ohboy-bench-saves");
+ 	sys_checkdir(savedir, 1); /* needs to be writable */
+ 
+ 	romfile = s;
+@@ -533,7 +623,7 @@
+ 	sram_load();
+ 	rtc_load();
+ 
+-	{ static int registered = 0; if (!registered) { atexit(cleanup); registered = 1; } }   /* explorer-fixes: once */
++	{ static int registered = 0; if (!registered) { atexit(cleanup); registered = 1; } }   /* s577: once */
+ }
+ 
+ rcvar_t loader_exports[] =
+--- a/gnuboy/main.c	2026-11-22 01:13:03.925444109 +0100
++++ b/gnuboy/main.c	2026-11-20 23:55:23.000000000 +0100
+@@ -116,7 +116,8 @@
+ }
+ 
+ 
+-extern volatile sig_atomic_t ohb_quit_requested;  /* explorer-fixes, main.c */
++extern volatile sig_atomic_t ohb_quit_requested;  /* s577, main.c */
++void sram_autoflush();   /* s580, loader.c */
+ 
+ void doevents()
+ {
+@@ -124,6 +125,7 @@
+ 	int st;
+ 
+ 	if (ohb_quit_requested) { ohb_clean_exit = 1; exit(0); }
++	sram_autoflush();   /* s580: in-game saves reach flash within a few seconds */
+ 	ev_poll();
+ 	while (ev_getevent(&ev))
+ 	{
+--- a/gnuboy/mem.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/mem.c	2026-11-21 16:05:50.000000000 +0100
+@@ -379,7 +379,8 @@
+ 			mbc.enableram = ((b & 0x0F) == 0x0A);
+ 			break;
+ 		case 0x2:
+-			if ((b & 0xFF) == 0) b = 0x01;
++			/* s580: MBC5 can map bank 0 here (unlike MBC1); the old 0 -> 1 rule also made
++			** bank 0x100 select 0x101 */
+ 			mbc.rombank = (mbc.rombank & 0x100) | (b & 0xFF);
+ 			break;
+ 		case 0x3:
+--- a/gnuboy/pcm.h	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/pcm.h	2026-11-21 15:52:39.000000000 +0100
+@@ -9,7 +9,7 @@
+ {
+ 	int hz, len;
+ 	int stereo;
+-	byte *buf;
++	n16 *buf;   /* s583: signed 16-bit (was 8-bit unsigned); range -2048..2047, see sound_mix() */
+ 	int pos;
+ };
+ 
+--- a/gnuboy/rccmds.c	2026-11-22 01:13:03.925499127 +0100
++++ b/gnuboy/rccmds.c	2026-11-19 21:17:23.000000000 +0100
+@@ -75,7 +75,7 @@
+ extern int ohb_clean_exit;
+ static int cmd_quit()
+ {
+-	ohb_clean_exit = 1;   /* explorer-fixes */
++	ohb_clean_exit = 1;   /* s577 */
+ 	exit(0);
+ 	/* NOT REACHED */
+ }
+--- a/gnuboy/refresh.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/refresh.c	2026-11-22 00:36:09.000000000 +0100
+@@ -19,7 +19,32 @@
+ #ifndef ASM_REFRESH_2
+ void refresh_2(un16 *dest, byte *src, un16 *pal, int cnt)
+ {
++#ifdef IS_LITTLE_ENDIAN
++	/* s583: two pixels per 32-bit store (four per loop), same palette lookups and same
++	** bytes in the same places as one 16-bit store per pixel (Codex chunk 7) */
++	/* s583 (patch 0010): each word is compared with what the frame buffer held before, and any
++	** difference sets lcd_frame_changed, which replaces the full-frame memcmp against a copy of the
++	** shown picture in vid_end (main.c). Reading the old word first also brings the line into the
++	** ARM926 D-cache (it allocates on reads only), so the stores hit the cache. */
++	un32 *d, v0, v1, diff = 0;
++	if (((unsigned long)dest & 2) && cnt > 0) { diff |= *dest ^ pal[*src]; *(dest++) = pal[*(src++)]; cnt--; }
++	d = (un32 *)dest;
++	while (cnt >= 4)
++	{
++		v0 = (un32)pal[src[0]] | ((un32)pal[src[1]] << 16);
++		v1 = (un32)pal[src[2]] | ((un32)pal[src[3]] << 16);
++		diff |= (d[0] ^ v0) | (d[1] ^ v1);
++		d[0] = v0;
++		d[1] = v1;
++		d += 2; src += 4; cnt -= 4;
++	}
++	dest = (un16 *)d;
++	while (cnt--) { diff |= *dest ^ pal[*src]; *(dest++) = pal[*(src++)]; }
++	if (diff) lcd_frame_changed = 1;
++#else
++	lcd_frame_changed = 1;
+ 	while (cnt--) *(dest++) = pal[*(src++)];
++#endif
+ }
+ #endif
+ 
+--- a/gnuboy/rtc.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/rtc.c	2026-11-21 00:06:50.000000000 +0100
+@@ -28,7 +28,7 @@
+ 		rtc.regs[1] = rtc.m;
+ 		rtc.regs[2] = rtc.h;
+ 		rtc.regs[3] = rtc.d;
+-		rtc.regs[4] = (rtc.d>>9) | (rtc.stop<<6) | (rtc.carry<<7);
++		rtc.regs[4] = ((rtc.d>>8)&1) | (rtc.stop<<6) | (rtc.carry<<7);   /* s580: day bit 8 (was >>9) */
+ 		rtc.regs[5] = 0xff;
+ 		rtc.regs[6] = 0xff;
+ 		rtc.regs[7] = 0xff;
+@@ -60,7 +60,7 @@
+ 		break;
+ 	case 4:
+ 		rtc.regs[4] = b;
+-		rtc.d = (rtc.d & 0xff) | ((b&1)<<9);
++		rtc.d = (rtc.d & 0xff) | ((b&1)<<8);   /* s580: day bit 8 (was <<9) */
+ 		rtc.stop = (b>>6)&1;
+ 		rtc.carry = (b>>7)&1;
+ 		break;
+@@ -78,7 +78,7 @@
+ 			{
+ 				if (++rtc.h == 24)
+ 				{
+-					if (++rtc.d == 365)
++					if (++rtc.d == 512)   /* s580: MBC3 day counter is 9 bits (was 365) */
+ 					{
+ 						rtc.d = 0;
+ 						rtc.carry = 1;
+@@ -114,33 +114,48 @@
+ #endif /* GNUBOY_USE_BINARY_RTC_FILES */
+ }
+ 
++/*
++** s580: advance the clock by real seconds with arithmetic. Before: (now - saved) * 60 calls of
++** rtc_tick() in a loop; 1 day = 5.2 million calls, and a big jump (Leapster clock set from its
++** 2008 default to the real date) overflowed or took practically forever, freezing OhBoy at start.
++*/
++static void rtc_advance(long long secs)
++{
++	long long d;
++	if (rtc.stop || secs <= 0) return;
++	secs += rtc.s + 60LL * rtc.m + 3600LL * rtc.h;
++	d = rtc.d + secs / 86400;
++	secs %= 86400;
++	rtc.h = (int)(secs / 3600);
++	rtc.m = (int)(secs / 60 % 60);
++	rtc.s = (int)(secs % 60);
++	if (d >= 512) { rtc.carry = 1; d %= 512; }
++	rtc.d = (int) d;
++}
++
+ void rtc_load_internal(FILE *f)
+ {
+ 	time_t rt = 0;
+-#ifdef GNUBOY_USE_BINARY_RTC_FILES
+-	/* WARNING using binary real time clock files is not portable! */
+-	fread(&rtc.carry, sizeof(rtc.carry), 1, f);
+-	fread(&rtc.stop, sizeof(rtc.stop), 1, f);
+-	fread(&rtc.d, sizeof(rtc.d), 1, f);
+-	fread(&rtc.h, sizeof(rtc.h), 1, f);
+-	fread(&rtc.m, sizeof(rtc.m), 1, f);
+-	fread(&rtc.s, sizeof(rtc.s), 1, f);
+-	fread(&rtc.t, sizeof(rtc.t), 1, f);
+-	fread(&rt, sizeof(rt), 1, f);
+-#else /* GNUBOY_USE_BINARY_RTC_FILES */
+-	fscanf(
+-		f, "%d %d %d %02d %02d %02d %02d\n%d\n",
+-		&rtc.carry, &rtc.stop, &rtc.d,
+-		&rtc.h, &rtc.m, &rtc.s, &rtc.t, &rt);
+-#endif /* GNUBOY_USE_BINARY_RTC_FILES */
+-	while (rtc.t >= 60) rtc.t -= 60;
+-	while (rtc.s >= 60) rtc.s -= 60;
+-	while (rtc.m >= 60) rtc.m -= 60;
+-	while (rtc.h >= 24) rtc.h -= 24;
+-	while (rtc.d >= 365) rtc.d -= 365;
+-	rtc.stop &= 1;
+-	rtc.carry &= 1;
+-	if (rt) rt = (time(0) - rt) * 60;
+-	if (syncrtc) while (rt-- > 0) rtc_tick();
+-}
++	int carry, stop, d, h, m, s, t, saved;
++	long long elapsed;
+ 
++	/* s580: parse into temporaries; a damaged .rtc leaves the clock as it is */
++	if (fscanf(f, "%d %d %d %d %d %d %d\n%d\n", &carry, &stop, &d, &h, &m, &s, &t, &saved) != 8
++	    || d < 0 || h < 0 || m < 0 || s < 0 || t < 0) {
++		fprintf(stderr, "ohboy: .rtc file damaged, game clock not loaded\n");
++		return;
++	}
++	rtc.carry = carry & 1; rtc.stop = stop & 1;
++	rtc.d = d % 512; rtc.h = h % 24; rtc.m = m % 60; rtc.s = s % 60; rtc.t = t % 60;
++	rt = (time_t) saved;
++	if (!rt || !syncrtc) return;
++	elapsed = (long long) time(0) - (long long) rt;
++	/* The Leapster has no clock that survives battery changes: it boots on 2008-01-01.
++	** Backwards (clock reset) = no time passed. More than ~2 years forward = the clock was
++	** set, not real playtime: don't jump the game clock by years. */
++	if (elapsed < 0 || elapsed > 2LL * 366 * 86400) {
++		if (elapsed) fprintf(stderr, "ohboy: host clock jumped by %lld s since the last save, game clock not advanced\n", elapsed);
++		return;
++	}
++	rtc_advance(elapsed);
++}
+--- a/gnuboy/save.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/save.c	2026-11-21 00:04:35.000000000 +0100
+@@ -151,6 +151,62 @@
+ };
+ 
+ 
++/*
++** s580: check a save-state file before loading it. loadstate() trusts the file: it scans the
++** header until a zero key (can run past its 4 KB buffer), copies from file-given offsets, and
++** sets mbc.rambank, which then indexes ram.sbank without a bound. A damaged or foreign state
++** could crash OhBoy or corrupt memory, and auto-resume now loads a state on every start.
++** Returns 1 if the file looks sane for the ROM that is loaded now, else 0 (and logs why).
++*/
++static int hdr_get(un32 (*header)[2], int n, const char *key, un32 *out)
++{
++	int j;
++	for (j = 0; j < n; j++)
++		if (header[j][0] == *(un32 *)key) { *out = LIL(header[j][1]); return 1; }
++	return 0;
++}
++
++int state_check(FILE *f, const char *name)
++{
++	byte buf[4096];
++	un32 (*header)[2] = (un32 (*)[2])buf;
++	int n, cgb;
++	long size;
++	un32 v, ofs, blk;
++	const char *why = 0;
++
++	if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 4096) why = "too short";
++	else if (fseek(f, 0, SEEK_SET) != 0 || fread(buf, 4096, 1, f) != 1) why = "header unreadable";
++	if (!why) {
++		for (n = 0; n < 4096 / 8 && header[n][0]; n++);
++		if (n == 4096 / 8) why = "no header end";
++		else {
++			int a, b;   /* loadstate() applies every copy of a key, state_check() reads the first */
++			for (a = 0; a < n && !why; a++)
++				for (b = a + 1; b < n; b++)
++					if (header[a][0] == header[b][0]) { why = "duplicate header key"; break; }
++		}
++		if (why) ;
++		else if (!hdr_get(header, n, "GbSs", &v) || v < 0x100 || v > 0x105) why = "not a gnuboy state (version)";
++	}
++	cgb = hw.cgb;
++	if (!why && hdr_get(header, n, "cgb ", &v)) cgb = v ? 1 : 0;
++#define OFS_OK(k, len) (!hdr_get(header, n, k, &ofs) || ofs == 0 || (ofs < 4096 && ofs + (len) <= 4096))
++	if (!why && !(OFS_OK("hi  ", sizeof ram.hi) && OFS_OK("pal ", sizeof lcd.pal) &&
++	              OFS_OK("oam ", sizeof lcd.oam) && OFS_OK("wav ", sizeof snd.wave) &&
++	              OFS_OK("hram", 127))) why = "bad offset";
++#undef OFS_OK
++#define BLK_OK(k, len) (hdr_get(header, n, k, &blk) && blk > 0 && blk < 0x10000 && ((long)blk << 12) + (long)(len) <= size)
++	if (!why && !(BLK_OK("iram", 4096L * (cgb ? 8 : 2)) && BLK_OK("vram", 4096L * (cgb ? 4 : 2)) &&
++	              BLK_OK("sram", 8192L * mbc.ramsize))) why = "memory blocks missing or past end of file";
++#undef BLK_OK
++	if (!why && hdr_get(header, n, "ramb", &v) && v >= (un32) mbc.ramsize) why = "RAM bank out of range";
++	if (!why && hdr_get(header, n, "cgb ", &v) && (v ? 1 : 0) != (hw.cgb ? 1 : 0)) why = "GB/GBC mode differs from the loaded ROM";
++	fseek(f, 0, SEEK_SET);
++	if (why) fprintf(stderr, "ohboy: state %s rejected: %s\n", name ? name : "?", why);
++	return why == 0;
++}
++
+ void loadstate(FILE *f)
+ {
+ 	int i, j;
+@@ -161,6 +217,8 @@
+ 	int vrl = hw.cgb ? 4 : 2;
+ 	int srl = mbc.ramsize << 1;
+ 
++	if (!state_check(f, "(load)")) return;   /* s580: never load a damaged state */
++
+ 	ver = hramofs = hiofs = palofs = oamofs = wavofs = 0;
+ 
+ 	fseek(f, 0, SEEK_SET);
+@@ -219,6 +277,8 @@
+ 	int vrl = hw.cgb ? 4 : 2;
+ 	int srl = mbc.ramsize << 1;
+ 
++	if (!state_check(f, "(load)")) return;   /* s580: never load a damaged state */
++
+ 	ver = hramofs = hiofs = palofs = oamofs = wavofs = 0;
+ 
+ 	fseek(f, 0, SEEK_SET);
+--- a/gnuboy/sound.c	2018-02-23 04:34:30.000000000 +0100
++++ b/gnuboy/sound.c	2026-11-21 15:55:17.000000000 +0100
+@@ -108,7 +108,7 @@
+ 	S2.endir |= S2.endir - 1;
+ 	S2.enlen = (R_NR22 & 7) << 15;
+ 	s2_freq();
+-	S3.len = (256-R_NR31) << 20;
++	S3.len = (256-R_NR31) << 13;   /* s580: same unit as sound_write(); was << 20 */
+ 	s3_freq();
+ 	S4.len = (64-(R_NR41&63)) << 13;
+ 	S4.envol = R_NR42 >> 4;
+@@ -229,7 +229,7 @@
+ 			S3.pos += S3.freq;
+ 			if ((R_NR34 & 64) && ((S3.cnt += RATE) >= S3.len))
+ 				S3.on = 0;
+-			if (R_NR32 & 96) s <<= (3 - ((R_NR32>>5)&3));
++			if (R_NR32 & 96) s *= 1 << (3 - ((R_NR32>>5)&3));   /* s583: s can be negative; << on it is undefined in C */
+ 			else s = 0;
+ 			if (R_NR51 & 4) r += s;
+ 			if (R_NR51 & 64) l += s;
+@@ -259,13 +259,13 @@
+ 		
+ 		l *= (R_NR50 & 0x07);
+ 		r *= ((R_NR50 & 0x70)>>4);
+-		l >>= 4;
+-		r >>= 4;
+-		
+-		if (l > 127) l = 127;
+-		else if (l < -128) l = -128;
+-		if (r > 127) r = 127;
+-		else if (r < -128) r = -128;
++		/* s583: keep the 4 low bits. The old code shifted them away here and sent 8-bit
++		** samples (audible as hiss, worst when a game plays quietly). The clip is the old
++		** one (-128..127 after >> 4), so (sample >> 4) + 128 is exactly the old byte. */
++		if (l > 2047) l = 2047;
++		else if (l < -2048) l = -2048;
++		if (r > 2047) r = 2047;
++		else if (r < -2048) r = -2048;
+ 
+ 		if (pcm.buf)
+ 		{
+@@ -273,10 +273,10 @@
+ 				pcm_submit();
+ 			if (pcm.stereo)
+ 			{
+-				pcm.buf[pcm.pos++] = l+128;
+-				pcm.buf[pcm.pos++] = r+128;
++				pcm.buf[pcm.pos++] = l;
++				pcm.buf[pcm.pos++] = r;
+ 			}
+-			else pcm.buf[pcm.pos++] = ((l+r)>>1)+128;
++			else pcm.buf[pcm.pos++] = (l+r)>>1;
+ 		}
+ 	}
+ 	R_NR52 = (R_NR52&0xf0) | S1.on | (S2.on<<1) | (S3.on<<2) | (S4.on<<3);
+--- a/gui_sdl.c	2026-11-22 01:13:03.925564589 +0100
++++ b/gui_sdl.c	2026-11-22 01:13:03.968263502 +0100
+@@ -25,7 +25,7 @@
+ 	return SDL_MapRGB(screen->format,r,g,b);
+ }
+ 
+-extern volatile sig_atomic_t ohb_quit_requested;  /* explorer-fixes, main.c */
++extern volatile sig_atomic_t ohb_quit_requested;  /* s577, main.c */
+ extern int ohb_clean_exit;
+ 
+ int gui_pollevent(guievent_t *ev){
+@@ -152,7 +152,7 @@
+ 		if(event.type == SDL_KEYDOWN || event.type == SDL_KEYUP){
+ 			ev->state = event.key.state == SDL_PRESSED ? GUI_PRESSED : GUI_RELEASED;
+ 			switch(event.key.keysym.sym){
+-				/* explorer-fixes: same as the launcher (gmenunx) and the games: right button (B) = choose,
++				/* s577: same as the launcher (gmenunx) and the games: right button (B) = choose,
+ 				 * left button (A) = back, like a real Game Boy */
+ 				case SDLK_b:
+ 					ev->key = GUI_SELECT;
+@@ -304,6 +304,8 @@
+ }
+ 
+ void gui_begin(){
++	extern void vid_shadow_sync();
++	vid_shadow_sync();   /* s583 (patch 0010): after direct screen frames, SDL's copy is stale */
+ 	SDL_LockSurface(screen);
+ 	fbsz = screen->h * screen->pitch;
+ 	fbcopy = malloc(fbsz);
+@@ -429,6 +431,8 @@
+ {
+     char *local_filename=NULL;
+     SDL_Surface *local_screen=NULL;
++    extern void vid_shadow_sync();
++    vid_shadow_sync();   /* s583 (patch 0010, Codex chunk 9): SDL's copy may be stale after direct frames */
+     
+     
+     local_screen = screen_to_save;
+--- a/main.c	2026-11-22 01:13:03.925723829 +0100
++++ b/main.c	2026-11-22 01:13:03.967313156 +0100
+@@ -2,6 +2,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <signal.h>
++#include <sys/time.h>   /* s580: gettimeofday for the timing probe */
+ #include <unistd.h>  /* for getcwd() */
+ 
+ /* posix includes for mkdir */
+@@ -13,6 +14,11 @@
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #endif
++/* s583 (patch 0010): the direct screen path (vid_direct_ok) opens and maps /dev/fb0 */
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <linux/fb.h>
+ 
+ #include <SDL/SDL.h>
+ #ifdef OHBOY_USE_SDL_IMAGE
+@@ -130,6 +136,27 @@
+ 
+ struct fb vid_fb;
+ static un16 vid_frame[160*144];
++/* s583: skip unchanged frames (Codex chunk 7). When the next Game Boy picture is identical to
++** the one on the screen and nothing else draws (menu, volume bar, FPS counter, borders,
++** blending), scaling and SDL_Flip are skipped: same screen, less work and battery.
++** vid_shown_ok = 0 forces the next frame to be drawn. OHBOY_NOSKIP=1 = off.
++** s583 (patch 0010): "identical" now comes from lcd_frame_changed, which the scanline code sets
++** when it writes a pixel value that differs from what vid_frame held (refresh_2 compares as it
++** writes; the clear and the rarely used other refresh paths always set it). vid_frame is only
++** written there, so a changed picture is never skipped; without the 46 KB copy and the two
++** full-frame passes. (Codex chunk 9: it can draw a frame the old memcmp skipped, when lines change
++** and change back within one frame, e.g. LCD off/on mid-frame; that only costs one redraw.) */
++extern int lcd_frame_changed;   /* gnuboy/lcd.c */
++int vid_shown_ok = 0;
++static int vid_noskip = -1;
++
++/* returns 1 if the picture did not change since the last call */
++static int vid_frame_unchanged()
++{
++	int same = !lcd_frame_changed;
++	lcd_frame_changed = 0;
++	return same;
++}
+ SDL_Surface *screen;
+ int framecounter = 0;
+ 
+@@ -161,11 +188,15 @@
+ 
+ n16 *buf;
+ n16 pcm_buffer[PCM_BUFFER << 1];
+-byte pcm_frame[PCM_FRAME << 1];
++n16 pcm_frame[PCM_FRAME << 1];   /* s583: 16-bit mix */
+ volatile int pcm_buffered = 0;
+ 
+ n16 *pcm_head, *pcm_tail;
+ int pcm_soft_volume=0x80, pcm_bufferlen;
++static int pcm_bench;   /* s583: OHBOY_BENCH=1 speed test */
++static unsigned bench_sound_hash = 2166136261u;
++static int pcm_ok;   /* s580: defined with the audio code below */
++long long pcm_wait_us = 0;   /* s580: time spent waiting for the sound card (timing probe) */
+ 
+ SDL_Joystick * sdl_joy;
+ static const int joy_commit_range = 3276;
+@@ -273,9 +304,11 @@
+ 
+ 
+ void vid_init() {
++	vid_shown_ok = 0;   /* s583 */
+ 
+ 
+ 	SDL_LockSurface(screen);
++	vid_fb.enabled = 1;   /* s580: started at 0; auto frameskip without audio never drew anything */
+ 	vid_fb.w = screen->w;
+ 	vid_fb.h = screen->h;
+ 	vid_fb.pelsize = screen->format->BytesPerPixel;
+@@ -1409,12 +1442,16 @@
+ }
+ #endif
+ 
++void vid_shadow_sync();
+ void vid_begin(){
+ 	ohb_updatecpu(cpu_speed);
+ 	if(frameskip>=0)
+ 		vid_fb.enabled = framecounter==0;
++	else if (!pcm_ok)
++		vid_fb.enabled = 1;   /* s580: auto frameskip needs audio; without it, draw every frame */
+ 	fb.enabled = vid_fb.enabled;
+ 	fb.ptr = vid_frame;
++	if ((vid_fb.first_paint && bmpenabled) || vid_fb.dirty) { vid_shown_ok = 0; vid_shadow_sync(); }   /* s583 (0010): border code below flips SDL's copy */   /* s583: borders/clear repaint the screen (first_paint stays 1 when borders are off) */
+ 	
+ 		/* add border to display if enabled and not using fullscreen
+ 	   this should be integrated with vid_fb.dirty probably... */
+@@ -1431,7 +1468,6 @@
+ 		b = (colour & 0xFF0000) >> 16; //Remove G and R, shift it left by two bytes
+ 		g = (colour & 0x00FF00) >> 8; //Remove B and R, shift it left by one byte
+ 		r = (colour & 0x0000FF); //Remove B and G, this is already on the left.
+-		printf("r: %i g: %i b: %i\n", r, g, b);
+ 
+ 		uint16_t hexcolor;
+ 		hexcolor = ((r & 0xf8) << 8) | //mask out three bits, shift em to their place (rrrrr 000000 00000)
+@@ -1561,13 +1597,14 @@
+ 		b = (colour & 0xFF0000) >> 16; //Remove G and R, shift it left by two bytes
+ 		g = (colour & 0x00FF00) >> 8; //Remove B and R, shift it left by one byte
+ 		r = (colour & 0x0000FF); //Remove B and G, this is already on the left.
+-		printf("r: %i g: %i b: %i\n", r, g, b);
+ 
+ 		uint16_t hexcolor;
+ 		hexcolor = ((r & 0xf8) << 8) | //mask out three bits, shift em to their place (rrrrr 000000 00000)
+ 				((g & 0xfc) << 3) | //mask out two bits, move em to their place (rrrrr gggggg 00000)
+ 				((b & 0xf8) >> 3); //mask out three bits, shift em to their plae (rrrrr gggggg bbbbb)
+ 		SDL_FillRect(screen, &rect, hexcolor);
++		vid_fb.first_paint = 0;   /* s580: was refilled (and printf'd) on every single frame */
++		vid_fb.dirty = 0;
+ 	}
+ }
+ 
+@@ -1609,8 +1646,100 @@
+ #endif
+ }
+ 
++/*
++** s583 (patch 0010): direct screen writes. On the Leapster the screen surface is SDL_SWSURFACE, a
++** RAM copy that SDL_Flip copies to the framebuffer: measured 2.1 ms per frame, on top of 1.1 ms
++** for the scaler (device-upscale-2026-11-22.txt). When a frame is only the plain fullscreen scale
++** (upscaler 4, no blending, no volume bar, no FPS counter, no clear) it is scaled straight into
++** the visible framebuffer and SDL_Flip is skipped. SDL's RAM copy is then stale; vid_shadow_sync()
++** (called by gui_begin before the menu copies the screen as its background) refreshes it.
++** Every other frame takes the old path, which redraws the whole RAM copy and flips it.
++** Used only with SDL's fbcon driver on /dev/fb0 in exactly the screen's format (320x240, 16 bpp
++** RGB565 packed, 640-byte lines, no x offset), and only while the framebuffer is not panned
++** (checked before every direct frame). OHBOY_NODIRECT=1 turns it off. Known, accepted: after a
++** console switch SDL may flash its stale copy for one frame (Codex chunk 9; never seen here).
++*/
++static un16 *vid_direct = 0;
++static int vid_direct_state = 0;   /* 0 = not tried yet, 1 = usable, -1 = off */
++static int vid_shadow_stale = 0;
++static int vid_direct_fd = -1;
++static unsigned vid_direct_yoff;
++
++static int vid_direct_ok()
++{
++	struct fb_var_screeninfo v;
++	struct fb_fix_screeninfo f;
++	int fd;
++	void *m;
++	char drv[16];
++	const char *dev = getenv("SDL_FBDEV");
++	if (vid_direct_state > 0)
++	{
++		/* still the same screen position? (SDL or another program could pan the framebuffer) */
++		if (ioctl(vid_direct_fd, FBIOGET_VSCREENINFO, &v) == 0 && v.yoffset == vid_direct_yoff && v.xoffset == 0)
++			return 1;
++		vid_direct_state = -1;
++		fprintf(stderr, "ohboy: framebuffer moved, direct video writes off\n");
++		return 0;
++	}
++	if (vid_direct_state) return 0;
++	vid_direct_state = -1;
++	if (getenv("OHBOY_NODIRECT") && *getenv("OHBOY_NODIRECT") == '1') return 0;
++	/* only SDL's own fbcon driver on /dev/fb0, with the screen as a plain software surface */
++	if (!SDL_VideoDriverName(drv, sizeof drv) || strcmp(drv, "fbcon") || (dev && strcmp(dev, "/dev/fb0"))) return 0;
++	if (!screen || (screen->flags & (SDL_HWSURFACE | SDL_DOUBLEBUF)) || screen->w != 320 || screen->h != 240
++		|| screen->pitch != 640 || screen->format->BitsPerPixel != 16 || screen->format->Rmask != 0xf800
++		|| screen->format->Gmask != 0x07e0 || screen->format->Bmask != 0x001f) return 0;
++	if ((fd = open("/dev/fb0", O_RDWR)) < 0) return 0;
++	if (ioctl(fd, FBIOGET_VSCREENINFO, &v) || ioctl(fd, FBIOGET_FSCREENINFO, &f)
++		|| f.type != FB_TYPE_PACKED_PIXELS || v.xres != 320 || v.yres != 240 || v.xoffset != 0
++		|| v.bits_per_pixel != 16 || f.line_length != 640
++		|| v.red.offset != 11 || v.red.length != 5 || v.red.msb_right
++		|| v.green.offset != 5 || v.green.length != 6 || v.green.msb_right
++		|| v.blue.offset != 0 || v.blue.length != 5 || v.blue.msb_right
++		|| (f.smem_start & 4095) || (v.yoffset + 240) * 640 > f.smem_len) { close(fd); return 0; }
++	m = mmap(0, (v.yoffset + 240) * 640, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if (m == MAP_FAILED) { close(fd); return 0; }
++	vid_direct = (un16 *)((byte *)m + v.yoffset * 640);
++	vid_direct_fd = fd;   /* kept open for the per-frame position check */
++	vid_direct_yoff = v.yoffset;
++	fprintf(stderr, "ohboy: video writes go straight to /dev/fb0 (OHBOY_NODIRECT=1 = off)\n");
++	vid_direct_state = 1;
++	return 1;
++}
++
++/* bring SDL's RAM copy of the screen up to date after direct frames (before the GUI reads it) */
++void vid_shadow_sync()
++{
++	if (!vid_shadow_stale) return;
++	SDL_LockSurface(screen);
++	gb_upscale((uint32_t *)screen->pixels, (uint32_t *)vid_frame);
++	SDL_UnlockSurface(screen);
++	vid_shadow_stale = 0;
++}
++
+ void vid_end() {
+ 	if(fb.enabled){
++		int skip, same;
++		if (vid_noskip < 0) vid_noskip = getenv("OHBOY_NOSKIP") && *getenv("OHBOY_NOSKIP") == '1';
++		same = vid_frame_unchanged();   /* also clears lcd_frame_changed for the next frame */
++		skip = same && vid_shown_ok && !vid_noskip && !vid_fb.dirty && !blendframes
++			&& !osd_persist && !dvolume && !sdl_showfps;
++		if (pcm_bench) { static int told; if (!told++) {   /* s583: where the screen surface lives */
++			char l[256]; FILE *m = fopen("/proc/self/maps", "r");
++			fprintf(stderr, "ohboy bench screen pixels %p flags 0x%x pitch %d\n", screen->pixels, screen->flags, screen->pitch);
++			while (m && fgets(l, sizeof l, m)) if (strstr(l, "fb")) fprintf(stderr, "ohboy bench map %s", l);
++			if (m) fclose(m); } }
++		if (pcm_bench) { static int ns, nsame, nf; nf++; ns += skip; nsame += same; if (nf % 600 == 0) fprintf(stderr, "ohboy bench skip %d same %d of %d dirty %d ok %d\n", ns, nsame, nf, vid_fb.dirty, vid_shown_ok); }
++		vid_shown_ok = 1;
++		if (!skip && upscaler == 4 && !blendframes && !osd_persist && !dvolume && !sdl_showfps
++			&& !vid_fb.dirty && vid_direct_ok()) {
++			gb_upscale((uint32_t *)vid_direct, (uint32_t *)fb.ptr);   /* s583: no SDL copy, no flip */
++			vid_shadow_stale = 1;
++			skip = 2;
++		}
++		if (!skip) {
++		vid_shadow_stale = 0;   /* the code below redraws all of SDL's RAM copy, then flips it */
+ 		vid_fb.ptr = screen->pixels;
+ 		SDL_LockSurface(screen);
+ 
+@@ -1688,9 +1817,11 @@
+ 		if(osd_persist || dvolume){
+ 			osd_volume();
+ 			vid_fb.dirty=1;
++			vid_shown_ok = 0;   /* s583: the bar is on screen; draw the next frame too */
+ 			if(osd_persist) osd_persist--;
+ 		}
+ 		SDL_UnlockSurface(screen);
++		}   /* s583: !skip */
+         
+         /* 
+         ** NOTE Oh Boy now has the option of 2 font systems...
+@@ -1721,26 +1852,79 @@
+             }
+         }
+ 
+-		SDL_Flip(screen);
++		if (pcm_bench) {   /* s583: speed test also proves the picture and sound did not change */
++			static int n = 0;
++			if (++n % 60 == 0) {
++				unsigned h = 2166136261u; int y, x;
++				for (y = 0; y < screen->h; y++) {   /* s583: hash what is really on the screen */
++					byte *r = (vid_shadow_stale ? (byte *)vid_direct : (byte *)screen->pixels) + y * screen->pitch;
++					for (x = 0; x < screen->w * 2; x++) h = (h ^ r[x]) * 16777619u;
++				}
++				fprintf(stderr, "ohboy bench frame %d video %08x sound %08x\n", n, h, bench_sound_hash);
++			}
++		}
++		if (!skip) SDL_Flip(screen);
+ 	}
+ 	framecounter++;
+ 	if(framecounter>frameskip) framecounter = 0;
+ 
+ }
+ 
++/*
++** s580 sound path rework (Leapster Explorer):
++**  - the ring buffer is guarded by SDL_LockAudio() (the callback runs under the same lock);
++**    before, pcm_buffered += / -= raced between the emulator and the audio thread
++**  - the callback copies what is really queued (any len) and leaves silence for the rest
++**  - the producer waits with SDL_Delay(1) instead of a 100% CPU spin (one ARM9 core is
++**    shared with the audio thread), gives up after 500 ms, and still honours SIGTERM
++**  - SDL audio errors are logged; if audio can't open, pcm_submit() returns 0 so the
++**    emulator falls back to timer pacing (before: no sound AND no speed limit, silently)
++*/
++void sram_flush_now();   /* s580, gnuboy/loader.c */
++void ev_clear();   /* s580, gnuboy/events.c */
++void pad_refresh();
++static int pcm_ok = 0;
++static int pcm_rd = 0, pcm_wr = 0;
++static volatile int pcm_underruns = 0;   /* ring indices in n16 samples, guarded by SDL audio lock */
++extern volatile sig_atomic_t ohb_quit_requested;
++
+ static void audio_callback(void *d, byte *stream, int len) {
+-	if(pcm_buffered==0) return;
+-	memcpy(stream, pcm_tail, len);
+-	pcm_tail += pcm.len;
+-	if(pcm_tail == pcm_buffer+pcm_bufferlen) pcm_tail = pcm_buffer;
+-	pcm_buffered -= pcm.len;
++	int want = len / (int) sizeof(n16), n, first;
++	n16 *out = (n16 *) stream;
++
++	n = pcm_buffered < want ? pcm_buffered : want;
++	first = pcm_bufferlen - pcm_rd;
++	if (first > n) first = n;
++	memcpy(out, pcm_buffer + pcm_rd, first * sizeof(n16));
++	if (n > first) memcpy(out + first, pcm_buffer, (n - first) * sizeof(n16));
++	pcm_rd = (pcm_rd + n) % pcm_bufferlen;
++	pcm_buffered -= n;
++	if (n < want) {
++		memset(out + n, 0, (want - n) * sizeof(n16));
++		if (n) pcm_underruns++;   /* logged from the main thread, never under the audio lock */
++	}
+ }
+ 
+ #ifndef GNUBOY_DISABLE_SDL_SOUND
+ #ifndef OHBOY_DISABLE_SDL_SOUND
+ void pcm_init(){
+ 	SDL_AudioSpec as;
+-	SDL_InitSubSystem(SDL_INIT_AUDIO);
++	char drv[32] = "?";
++
++	pcm_ok = 0;
++	if (getenv("OHBOY_BENCH") && *getenv("OHBOY_BENCH") == '1') {
++		/* s583: speed test. No sound card and no waiting: the emulator runs flat out, still mixing
++		** and converting the sound, so every run does the same work. Never set on the device. */
++		pcm_bench = 1;
++		pcm.hz = PCM_SAMPLERATE; pcm.stereo = 1; pcm.len = PCM_FRAME<<1; pcm.buf = pcm_frame; pcm.pos = 0;
++		pcm_bufferlen = PCM_BUFFER << 1; pcm_rd = pcm_wr = 0; pcm_buffered = 0; pcm_ok = 1;
++		fprintf(stderr, "ohboy: OHBOY_BENCH=1, no audio device, no pacing\n");
++		return;
++	}
++	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
++		fprintf(stderr, "ohboy: SDL audio init FAILED: %s (no sound)\n", SDL_GetError());
++		return;
++	}
+ 
+ 	as.freq = PCM_SAMPLERATE;
+ 	as.format = AUDIO_S16;
+@@ -1749,40 +1933,72 @@
+ 	as.callback = audio_callback;
+ 	as.userdata = 0;
+ 
+-	if (SDL_OpenAudio(&as, 0))
++	if (SDL_OpenAudio(&as, 0)) {
++		fprintf(stderr, "ohboy: SDL_OpenAudio FAILED: %s (no sound)\n", SDL_GetError());
+ 		return;
++	}
++	SDL_AudioDriverName(drv, sizeof drv);
++	fprintf(stderr, "ohboy: audio %s, %d Hz, %d ch, %d samples per callback\n", drv, as.freq, as.channels, as.samples);
+ 
+ 	pcm.hz = as.freq;
+ 	pcm.stereo = as.channels - 1;
+ 	pcm.len = PCM_FRAME<<pcm.stereo;
+ 	pcm.buf = pcm_frame;
+ 	pcm.pos = 0;
+-	memset(pcm.buf, 0, pcm.len);
++	memset(pcm.buf, 0, pcm.len * sizeof *pcm.buf);
+ 
+-	pcm_head = pcm_buffer;
+-	pcm_tail = pcm_buffer;
+ 	pcm_bufferlen = PCM_BUFFER << pcm.stereo;
++	pcm_rd = pcm_wr = 0;
+ 	pcm_buffered = 0;
++	pcm_ok = 1;
+ 
+ 	SDL_PauseAudio(0);
+ }
+ 
+ int pcm_submit(){
+ 	static int lastbuffer = 0;
+-	byte *src;
+-	n16 sample;
++	n16 *src;
++	int sample;
++	n16 *dst;
++	int i, buffered;
++	Uint32 t0 = 0;
+ #define DEBUG_DISABLE_SOUND
+ #undef DEBUG_DISABLE_SOUND
+ #ifdef DEBUG_DISABLE_SOUND
+ return 0; /* no sound */
+ #endif /* DEBUG_DISABLE_SOUND */
+-    
++
++	if (!pcm_ok) {
++		pcm.pos = 0;   /* keep sound_mix() inside pcm.buf */
++		return 0;      /* no working audio: let emu_run() pace by timer */
++	}
+ 	if(pcm.pos<pcm.len)
+ 		return 1;
+ 
+-	if (pcm_buffered>=1) while(pcm_buffered == pcm_bufferlen);
+-
+-	src = pcm.buf;
++	/* wait for room for one block, yielding the CPU to the audio thread */
++	if (pcm_bench) pcm_buffered = 0;   /* speed test: a sound card that is always ready */
++	for (;;) {
++		SDL_LockAudio();
++		buffered = pcm_buffered;
++		SDL_UnlockAudio();
++		if (buffered + pcm.len <= pcm_bufferlen) {
++			if (t0) { struct timeval tv; gettimeofday(&tv, 0); pcm_wait_us += tv.tv_sec * 1000000LL + tv.tv_usec; }
++			break;
++		}
++		if (!t0) { struct timeval tv; gettimeofday(&tv, 0); pcm_wait_us -= tv.tv_sec * 1000000LL + tv.tv_usec; t0 = SDL_GetTicks(); }
++		if (ohb_quit_requested) {
++			pcm.pos = 0;   /* quitting: drop this block */
++			return 1;
++		}
++		if (SDL_GetTicks() - t0 >= 500) {
++			fprintf(stderr, "ohboy: audio stalled for 500 ms, sound off, timer pacing\n");
++			SDL_PauseAudio(1);
++			pcm_ok = 0;
++			pcm.pos = 0;
++			return 0;
++		}
++		SDL_Delay(1);
++	}
+ 
+ 	pcm_soft_volume += dvolume;
+ 	if(pcm_soft_volume < 0)
+@@ -1790,23 +2006,53 @@
+ 	else if(pcm_soft_volume >256)
+ 		pcm_soft_volume = 256;
+ 
+-	while(pcm.pos){
+-		sample = (*src++) - 128;
+-		sample = sample * pcm_soft_volume * VOL_MULTIPLIER;
+-		*(pcm_head++) = sample;
+-		pcm.pos--;
++	/* convert into the ring; only the producer moves pcm_wr, and the free space checked
++	   above can only grow while we write, so the copy itself needs no lock */
++	/* s583: 12-bit mix sample (-2048..2047) * volume (0..256) / 16 fits 16 bits for
++	** VOL_MULTIPLIER 1; the old 8-bit path gave the same level with 16x coarser steps.
++	** Written in at most two runs (up to the ring's end, then from its start) instead of
++	** testing for the wrap after every sample. */
++	src = pcm.buf;
++	{
++		int vol = pcm_soft_volume * VOL_MULTIPLIER, run, left = pcm.pos, at = pcm_wr;
++		while (left > 0) {
++			run = pcm_bufferlen - at;
++			if (run > left) run = left;
++			dst = pcm_buffer + at;
++			for (i = 0; i < run; i++) {
++				sample = (*src++) * vol >> 4;
++				if (sample > 32767) sample = 32767;
++				else if (sample < -32768) sample = -32768;
++				*dst++ = sample;
++			}
++			left -= run;
++			at = 0;
++		}
++	}
++	SDL_LockAudio();
++	if (pcm_bench) for (i = 0; i < pcm.pos; i++)   /* hash of the old 8-bit value: must not change */
++		bench_sound_hash = (bench_sound_hash ^ (byte)((pcm.buf[i] >> 4) + 128)) * 16777619u;
++	pcm_wr = (pcm_wr + pcm.pos) % pcm_bufferlen;
++	pcm_buffered += pcm.pos;
++	buffered = pcm_buffered;
++	SDL_UnlockAudio();
++	pcm.pos = 0;
++	{
++		static int logged = 0;
++		int u = pcm_underruns;
++		if (u > logged && logged < 5) { fprintf(stderr, "ohboy: audio underruns so far: %d\n", u); logged = u; }
+ 	}
+-	if(pcm_head == pcm_buffer + pcm_bufferlen)
+-		pcm_head = pcm_buffer;
+ 
+-	pcm_buffered += pcm.len;
+ 	if(frameskip==-1){
+-		if(pcm_buffered<lastbuffer)
+-			vid_fb.enabled = 0;
+-		else if(pcm_buffered==pcm_bufferlen || pcm_buffered==0)
+-			vid_fb.enabled = 1;
++		/* s580: auto frameskip. Old rule (queue shrank -> stop drawing; only an exactly full
++		** or empty queue -> draw again) could stop drawing for good. Now: if only the block
++		** just added is queued we are behind, so skip drawing the next frame, but never more
++		** than 3 frames in a row. */
++		static int skipped = 0;
++		if (buffered <= pcm.len && skipped < 3) { vid_fb.enabled = 0; skipped++; }
++		else { vid_fb.enabled = 1; skipped = 0; }
+ 	}
+-	lastbuffer = pcm_buffered;
++	lastbuffer = buffered;
+ 
+ 	return 1;
+ }
+@@ -1879,7 +2125,7 @@
+ }
+ 
+ void sys_checkdir(char *path, int wr) {
+-	/* explorer-fixes: create the directory and its parents (was a no-op, so savedir never existed) */
++	/* s577: create the directory and its parents (was a no-op, so savedir never existed) */
+ 	char *p, *d;
+ 	if (!path || !*path) return;
+ 	d = strdup(path);
+@@ -1920,14 +2166,23 @@
+ 		switch(event.type)
+ 		{
+ 		case SDL_ACTIVEEVENT:
++			vid_shown_ok = 0;   /* s583: something else may have drawn on the screen */
+ 			if (event.active.state == SDL_APPACTIVE)
+ 				fb.enabled = event.active.gain;
++			if (!event.active.gain && (event.active.state & (SDL_APPACTIVE | SDL_APPINPUTFOCUS))) {
++				dvolume = 0;   /* s580: losing focus releases everything */
++				hw.pad = 0;
++				ev_clear();
++				pad_refresh();
++			}
+ 			break;
+ 		case SDL_KEYDOWN:
+ 			if(event.key.keysym.sym==SDLK_EQUALS || event.key.keysym.sym==SDLK_u){
+ 				dvolume = 1;
++				break;   /* s580: volume keys are not game input */
+ 			} else if(event.key.keysym.sym==SDLK_MINUS || event.key.keysym.sym==SDLK_d){
+ 				dvolume = - 1;
++				break;
+ #ifdef DINGOO_NATIVE
+ 			} else if(event.key.keysym.sym==SDLK_PAUSE){
+ 				dvolume = 0;
+@@ -1982,11 +2237,16 @@
+ #endif /*DINGOO_OPENDINGUX*/
+ #ifndef DINGOO_BUILD
+ 			} else if(event.key.keysym.sym==SDLK_ESCAPE || event.key.keysym.sym==SDLK_RETURN){
+-				/* explorer-fixes: Leapster Explorer has no Escape; Home sends Enter */
++				/* s577: Leapster Explorer has no Escape; Home sends Enter */
++				sram_flush_now();   /* s580: a save made just before Home reaches flash */
+ 				dvolume = 0;
+ 				osd_persist = 0;
+ 				hw.pad = 0;
++				ev_clear();   /* s580: no stuck button after the menu */
+ 				menu();
++				ev_clear();
++				hw.pad = 0;
++				pad_refresh();
+ 				break;
+ 			}
+ #endif
+@@ -1998,10 +2258,12 @@
+ 			if(event.key.keysym.sym==SDLK_EQUALS || event.key.keysym.sym==SDLK_u){
+ 				dvolume = 0;
+ 				osd_persist = 60;
++				break;
+ 			} else if(event.key.keysym.sym==SDLK_MINUS || event.key.keysym.sym==SDLK_d){
+ 				//TakeScreenShot((SDL_Surface *) NULL, (char *) NULL); /* this works in game and allows volume bar to be included in the screenshot (but takes screen shot every time volume is lowered). */
+ 				dvolume = 0;
+ 				osd_persist = 60;
++				break;
+ 			} else if (event.key.keysym.sym == SCREENSHOT_SDL_KEY){
+ 				TakeScreenShot((SDL_Surface *) NULL, (char *) NULL);
+ 			}
+@@ -2161,7 +2423,7 @@
+ 			break;
+ #endif /* DISABLE_JOYSTICK */
+ 		case SDL_QUIT:
+-			exit(1);
++			ohb_quit_requested = 1;   /* s580: same clean exit as SIGTERM (saves + auto-state) */
+ 			break;
+ 		default:
+ 			break;
+@@ -2182,18 +2444,24 @@
+ 	0
+ };
+ 
+-volatile sig_atomic_t ohb_quit_requested = 0;   /* explorer-fixes */
++volatile sig_atomic_t ohb_quit_requested = 0;   /* s577 */
+ 
+ static void fatalsignal(int s)
+ {
+ 	if (s == SIGTERM || s == SIGINT) {
+-		/* explorer-fixes: power button / shutdown. Checked once per frame in doevents()
++		/* s577: power button / shutdown. Checked once per frame in doevents()
+ 		 * and in the menu loop, which then exit cleanly (auto save-state + SRAM). */
+ 		ohb_quit_requested = 1;
+ 		signal(s, fatalsignal);
+ 		return;
+ 	}
+-	die("Signal %d\n", s);
++	{
++		/* s580: a crash may mean corrupted memory. exit() would run cleanup(), which saves
++		** SRAM/RTC over the last good files. Leave without any atexit handler instead. */
++		static const char msg[] = "ohboy: fatal signal, exiting WITHOUT saving\n";
++		write(2, msg, sizeof msg - 1);
++		_exit(128 + s);
++	}
+ }
+ 
+ static void catch_signals()
+@@ -2235,7 +2503,7 @@
+ 
+ 	loader_init(rom);
+ 	emu_reset();
+-	autostate_load();   /* explorer-fixes: resume where the power button left off */
++	autostate_load();   /* s577: resume where the power button left off */
+ 	vid_init();
+ 	scaler_init(0);
+ }
+--- a/menu.c	2026-11-22 01:13:03.925966717 +0100
++++ b/menu.c	2026-11-22 01:13:03.967994986 +0100
+@@ -1,5 +1,5 @@
+ #include <stdlib.h>
+-extern int ohb_clean_exit;   /* explorer-fixes, gnuboy/loader.c */
++extern int ohb_clean_exit;   /* s577, gnuboy/loader.c */
+ void state_save(int n);
+ #include <stdio.h>
+ #include <dirent.h>
+@@ -457,7 +457,7 @@
+ 			tstr = ctime(&time);
+ 
+ 			l = strlen(tstr);
+-			statebody[i] = malloc(l);
++			statebody[i] = malloc(l + 1);   /* s580: room for the NUL (was a 1-byte heap overflow) */
+ 			strcpy(statebody[i],tstr);
+ 			statebody[i][l-1]=0;
+ #else
+@@ -480,7 +480,7 @@
+ 		name = malloc(strlen(saveprefix) + 5);
+ 		sprintf(name, "%s.%03d", saveprefix, ret-1);
+ 		if(save){
+-			state_save(ret-1);   /* explorer-fixes: atomic write (tmp + fsync + rename) */
++			state_save(ret-1);   /* s577: atomic write (tmp + fsync + rename) */
+ 		}else if(statesram==0){
+ 			if(f=fopen(name,"rb")){
+ 				loadstate_nosram(f);
+@@ -842,8 +842,8 @@
+ 				file = fopen(ohboyrc,"w");
+ 				free (ohboyrc);
+ #else
+-				file = fopen("/configs/.ohboy/ohboy.rc","w");   /* explorer-fixes: same path as read */
+-				if (!file) file = fopen("/dev/null","w");   /* explorer-fixes: don't crash if not writable */
++				file = fopen("/configs/.ohboy/ohboy.rc","w");   /* s577: same path as read */
++				if (!file) file = fopen("/dev/null","w");   /* s577: don't crash if not writable */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+ 				for(i=0; i<9; i++){
+@@ -880,7 +880,7 @@
+ 	paldir = malloc(strlen(getenv("HOME")) + 28);
+ 	sprintf(paldir, "%s/.ohboy/palettes/", getenv("HOME"));
+ #else	
+-	paldir = "palettes";
++	paldir = strdup("palettes");   /* s580: freed at the end; a literal here crashed on free() */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+     pal = rc_getstr("palette");
+@@ -896,7 +896,7 @@
+ 	borderdir = malloc(strlen(getenv("HOME")) + 28);
+ 	sprintf(borderdir, "%s/.ohboy/borders/", getenv("HOME"));
+ #else	
+-	borderdir = "borders";
++	borderdir = strdup("borders");   /* s580: see paldir */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+     border = rc_getstr("border");
+@@ -1066,8 +1066,8 @@
+ 				file = fopen(videorc,"w");
+ 				free (videorc);
+ #else
+-				file = fopen("/configs/.ohboy/video.rc","w");   /* explorer-fixes: same path as read */
+-				if (!file) file = fopen("/dev/null","w");   /* explorer-fixes: don't crash if not writable */
++				file = fopen("/configs/.ohboy/video.rc","w");   /* s577: same path as read */
++				if (!file) file = fopen("/dev/null","w");   /* s577: don't crash if not writable */
+ #endif /* DINGOO_OPENDINGUX */
+ #endif /* DINGOO_SIM */
+ 				for(i=0; i<12; i++){
+@@ -1089,6 +1089,10 @@
+ int menu_input_settings(){
+ 
+ 	int ret=0, i=0, analog_input=0;
++	/* s580, Leapster Explorer: this dialog's row numbers don't match its actions on this build
++	** (Cancel applied, Apply did nothing) and it can't produce Explorer key bindings; it would
++	** only re-run stale commands. Buttons are set in /configs/.ohboy/bindings.rc instead. */
++	if (1) return 0;
+ #ifdef DINGOO_BUILD
+ 	int btna=1, btnb=2, btnx=0, btny=0, btnl=0, btnr=0;
+ #ifdef GCWZERO
+@@ -1447,7 +1451,7 @@
+ 				file = fopen(bindingsrc,"w");
+ 				free (bindingsrc);
+ #else
+-				/* explorer-fixes: disabled on the Leapster Explorer - this build cannot serialize its key
++				/* s577: disabled on the Leapster Explorer - this build cannot serialize its key
+ 				 * layout, so saving would replace /configs/.ohboy/bindings.rc with a broken one. */
+ 				file = NULL;
+ #endif /* DINGOO_OPENDINGUX */
+@@ -1504,6 +1508,8 @@
+ }
+ 
+ int menu(){
++	extern int vid_shown_ok;
++	vid_shown_ok = 0;   /* s583: the menu draws over the game; redraw the next frame */
+ 
+ 	char *dir;
+ 	int mexit=0;
+@@ -1581,7 +1587,7 @@
+ 				if(menu_about()) mexit=0;
+ 				break;
+ 			case 11:
+-				ohb_clean_exit = 1;   /* explorer-fixes: resume here next time */
++				ohb_clean_exit = 1;   /* s577: resume here next time */
+ 				exit(0);
+ 				break;
+ 			default:

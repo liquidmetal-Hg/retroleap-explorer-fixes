@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fetch everything the OhBoy build needs:
-#  - OhBoy source (hi-ban/ohboy at 4720bcf, the commit Retroleap alpha10's ohboy.mk pins) -> src/, patches 0001-0004 applied
+#  - OhBoy source (hi-ban/ohboy at 4720bcf, the commit Retroleap alpha10's ohboy.mk pins) -> src/, all patches in patches/ applied in order
 #  - Debian wheezy armel dev packages (headers, crt files) from archive.debian.org -> sysroot-debs/, checked by sha256
 set -euo pipefail
 W=$(cd "$(dirname "$0")" && pwd)

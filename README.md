@@ -5,6 +5,21 @@ Fixes for [Retroleap](https://github.com/mac2612/retroleap) **v2.0.0-alpha10** o
 > [!WARNING]
 > **Reported 2026-11-20: no sound at all** on my Explorer after installing the v0.1 `ohboy` (built with `-O3`, with Vol +/- mapped to OhBoy's volume). Being investigated. Until then, keep a copy of your original `/usr/bin/ohboy` (step 1 below) so you can put it back.
 
+> [!NOTE]
+> **This is the `testing-s583b` branch: a newer OhBoy that is not released yet.** `main` and the v0.1 release are unchanged.
+> - **The "no sound" report above was not OhBoy.** gmenunx had set the system volume so low (40 % = about -64 dB on the CS43L22) that it was silent.
+> - **What `ohboy/patches/0005-sound-saves-speed-s583b.patch` adds** on top of 0001-0004:
+>   - a reworked sound path (locked ring buffer, no busy-wait, audio errors logged, 16-bit mixing = less hiss)
+>   - in-game saves written to flash a few seconds after the game saves
+>   - safer save-state loading
+>   - MBC5/RTC fixes
+>   - stuck-button and menu fixes
+> - **It is also much faster:** a table-driven tile decoder, a faster CPU core, unchanged frames not redrawn, and plain fullscreen frames written straight to `/dev/fb0` instead of through SDL's extra copy (`OHBOY_NODIRECT=1` turns that off).
+> - **Measured on my Explorer, flat out, average of 9 games:** 9.1 ms per frame instead of 14.8 (Shantae 12.5 instead of 26.3; 16.7 ms = full speed). Picture and sound were identical to the old build in every test.
+> - `OHBOY_BENCH=1 OHBOY_FRAMES=N` is a speed-test mode: no audio device, saves only in `/tmp`.
+> - **Status:** speed-tested on the device and with offline tests only. **Not yet play-tested by a person** (menus, volume bar, screenshots, a normal session with sound). Use at your own risk, and keep your old `/usr/bin/ohboy`.
+> - `./get_sources.sh && ./build.sh` in `ohboy/` builds it. The result should have sha256 `dc02550976e7515c8c139b8ce82f4b1addf0c716481e7e36d5c32a158075481a`. No prebuilt binary is attached for this branch.
+
 **Status:** tested on **one** Leapster Explorer (factory firmware 1.3.4.2044 before flashing). Not tested on the LeapsterGS / LF2000; the LF2000 code paths are unchanged. This is a one-off share of what worked for me. There's no support and no release schedule.
 
 Background and the full bug report: [DCFUKSURMOM/retroleap#2](https://github.com/DCFUKSURMOM/retroleap/issues/2), and [mac2612/retroleap#58](https://github.com/mac2612/retroleap/issues/58) (OhBoy never saves).

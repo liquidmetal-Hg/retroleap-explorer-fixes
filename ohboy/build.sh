@@ -11,7 +11,8 @@ GCCINC=$($CC -print-file-name=include)
 GCCLIB=$(dirname "$($CC -print-libgcc-file-name)")
 ML=arm-linux-gnueabi
 ARCH="-march=armv5te -mtune=arm926ej-s -marm -mfloat-abi=soft"
-CFLAGS="$ARCH ${OPT:--O3} -fno-pie -fcommon -std=gnu89 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-return-mismatch -nostdinc -isystem $GCCINC -isystem $SR/usr/include/$ML -isystem $SR/usr/include -I$SR/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT"
+# -fno-strict-aliasing: gnuboy reads byte arrays through 32-bit pointers (patch 0005)
+CFLAGS="$ARCH ${OPT:--O3} -fno-strict-aliasing -fno-pie -fcommon -std=gnu89 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-return-mismatch -nostdinc -isystem $GCCINC -isystem $SR/usr/include/$ML -isystem $SR/usr/include -I$SR/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT"
 LIBDIRS="-L$SR/lib/$ML -L$SR/usr/lib/$ML -L$GCCLIB -Wl,-rpath-link,$SR/lib/$ML:$SR/usr/lib/$ML"
 STARTS="$SR/usr/lib/$ML/crt1.o $SR/usr/lib/$ML/crti.o $GCCLIB/crtbegin.o"
 ENDS="$GCCLIB/crtend.o $SR/usr/lib/$ML/crtn.o"
@@ -19,6 +20,8 @@ LDFLAGS="$ARCH -Wl,--as-needed -no-pie -nostdlib -Wl,--sysroot=$SR -Wl,--dynamic
 LIBS="-lSDLmain -lSDL -lz -lm -lpthread -lc -lgcc -lgcc_s $ENDS"
 cd "$W/src"
 make -f Makefile.linux_sdl clean >/dev/null 2>&1 || true
+# 'make clean' misses gnuboy/sys/sdl/*.o and gnuboy/unzip/*.o: delete every object file
+find . -name '*.o' -delete
 make -j4 -f Makefile.linux_sdl CC="$CC" LD="$CC" CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" LIBS="$LIBS" STAGING_DIR="$SR" ohboy
 mkdir -p "$OUT"; cp ohboy "$OUT/ohboy"
 echo "built $OUT/ohboy"
