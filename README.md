@@ -3,6 +3,15 @@
 Fixes for [Retroleap](https://github.com/mac2612/retroleap) **v2.0.0-alpha10** on the **LeapFrog Leapster Explorer (LF1000)**. Without them, Game Boy saves are lost, the power button does nothing useful, and the OhBoy menu can't be opened.
 
 > [!NOTE]
+> **v0.3 (2026-11-23): no more screen tearing, and faster.** It replaces the v0.2 binary.
+> - **Tearing fixed.** The Explorer's screen refreshes at 61.2 Hz, while OhBoy draws at the Game Boy's 59.7 Hz, whenever the sound buffer lets it. Earlier builds wrote each frame straight into the picture on screen, so the screen often showed half the old frame and half the new one. This was most visible when scrolling, as a line rolling through the picture. Measured on the device (share of changed frames caught mid-write): v0.2 82-83 %, the older SDL path 71-74 %, **v0.3 0 %** (Zelda DX, Super Mario Bros. Deluxe, Shantae).
+> - **How:** the screen memory (`/dev/fb0`) gets three pages. OhBoy draws each frame into a page that is neither on screen nor waiting, then pans to it. The LF1000 display only takes a new page at a refresh, so every refresh shows one whole frame. With three pages OhBoy never has to wait. `OHBOY_NOPAGEFLIP=1` turns it off. The menu, volume bar and borders still draw through SDL on page 0.
+> - **About 20 % faster than v0.2:** 7.2 ms per frame instead of 9.1 (average of 9 games, flat out, on my Explorer; 16.7 ms = full speed). James Bond 007 needs 42 % less time, the others 10-24 % less. The work: CPU core tweaks, DMG lines drawn as words, sprite lists per line, a line cache, only changed screen lines redrawn, and a profile-guided build. Picture and sound are identical to v0.2's in every test.
+> - **Profile-guided build:** the release binary was compiled using a profile recorded while it ran homebrew games only (2048, uCity). The profile is in `ohboy/pgo/`, and `./build.sh` uses it by default (`PGO=0` gives the plain build, about 10 % slower).
+> - **Tested:** offline save/resume checks 11/11 plus crash and bad-state checks 6/6; same picture and sound hashes as the previous build in 9 games; on the device, speed and picture/sound hashes plus the tearing measurement. Short play-test on my Explorer with no problems seen. **Not measured yet:** battery life compared with v0.2.
+> - `ohboy/patches/0006-speed-tearfree-s595.patch` = everything since 0005. `./get_sources.sh && ./make_sysroot.sh <rootfs> && ./build.sh` in `ohboy/` builds exactly the release binary with Debian's `gcc-arm-linux-gnueabi` 14.2.0: sha256 `c103b697f9b8694ebeb9ebb24dfaa5c6476a08af5a02b075ad8d5307cb985e2a`. (`build.sh` now also works when the sysroot path is relative.)
+
+> [!NOTE]
 > **v0.2 (2026-11-22): a newer OhBoy, play-tested on my Explorer.** It replaces the v0.1 binary.
 > - **The v0.1 "no sound" report was not OhBoy.** The launcher (gmenunx) had set the system volume so low that it was silent. Its percent goes straight to the CS43L22 codec at 0.5 dB per ALSA step: 40 % is about -64 dB (silent), 90 % about 0 dB, 100 % +12 dB (can distort). **Set the volume in the gmenunx menu to about 90 %**; OhBoy's Vol +/- only work within that level.
 > - **What `ohboy/patches/0005-sound-saves-speed-s583b.patch` adds** on top of 0001-0004:
@@ -44,7 +53,9 @@ Each changed script has a short header saying what changed. `original-alpha10/` 
 ```
 overlay/                 changed text files, at their paths on the device
 original-alpha10/        the same files from alpha10, for comparison
-ohboy/patches/           0001-0003 = Retroleap's own OhBoy patches, 0004 = these fixes, 0005 = v0.2 sound/saves/speed
+ohboy/patches/           0001-0003 = Retroleap's own OhBoy patches, 0004 = these fixes, 0005 = v0.2 sound/saves/speed,
+                         0006 = v0.3 speed + tear-free screen
+ohboy/pgo/               the profile for the v0.3 release build (GCC .gcda files, used by build.sh)
 ohboy/get_sources.sh     fetches OhBoy (hi-ban/ohboy @ 4720bcf) + Debian wheezy armel headers, checks sha256
 ohboy/make_sysroot.sh    builds the cross-compile sysroot (needs an unpacked alpha10 rootfs)
 ohboy/build.sh           cross-builds ohboy (Debian gcc-arm-linux-gnueabi, ARMv5TE soft-float)
@@ -82,7 +93,7 @@ Tested on a Raspberry Pi 5 (aarch64 Debian). It runs the Explorer's 32-bit ARM b
 cd ohboy
 ./get_sources.sh                          # OhBoy source + Debian debs, sha256-checked, patches applied
 ./make_sysroot.sh /path/to/unpacked/alpha10/rootfs
-./build.sh                                # -> ohboy/build/ohboy (OPT=-O2 to change optimisation)
+./build.sh                                # -> ohboy/build/ohboy (profile-guided; PGO=0 = plain, OPT=-O2 to change optimisation)
 ROM=/path/to/game.gb ./test_offline.sh /path/to/unpacked/alpha10/rootfs
 ```
 
@@ -98,6 +109,7 @@ The binary links against the device's own glibc 2.18, SDL 1.2 and zlib (taken fr
 ## Known issues
 
 - **Quiet or no sound:** raise the volume in the gmenunx menu (about 90 %, see the note at the top). The v0.1 report of no sound at all had this cause. The audio stutter of the v0.1/-O2 builds is gone in v0.2.
+- **Slightly uneven motion:** OhBoy times its frames by the sound buffer (1024 samples = 23 ms per callback), so frames come in small bursts, not exactly one per refresh. v0.3 removes the tearing but not this.
 - **Save files are dated 2008:** the Explorer's clock is not set, and Retroleap has no network time. Fix the clock with `date -s` over SSH.
 - A long press on Power (2 s or more) is the kernel's hard power cut; nothing is saved then.
 

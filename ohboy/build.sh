@@ -4,7 +4,7 @@
 # from a sysroot of Debian wheezy armel dev packages (glibc 2.13 <= device 2.18) + the device's own libSDL/libz.
 set -euo pipefail
 W=$(cd "$(dirname "$0")" && pwd)
-SR=${SR:-./work/ohboy-sysroot}
+SR=$(cd "${SR:-./work/ohboy-sysroot}" && pwd)   # v0.3: absolute, because the build runs inside src/
 OUT=${OUT:-$W/build}
 CC=arm-linux-gnueabi-gcc
 GCCINC=$($CC -print-file-name=include)
@@ -12,7 +12,19 @@ GCCLIB=$(dirname "$($CC -print-libgcc-file-name)")
 ML=arm-linux-gnueabi
 ARCH="-march=armv5te -mtune=arm926ej-s -marm -mfloat-abi=soft"
 # -fno-strict-aliasing: gnuboy reads byte arrays through 32-bit pointers (patch 0005)
-CFLAGS="$ARCH ${OPT:--O3} -fno-strict-aliasing -fno-pie -fcommon -std=gnu89 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-return-mismatch -nostdinc -isystem $GCCINC -isystem $SR/usr/include/$ML -isystem $SR/usr/include -I$SR/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT"
+# v0.3: profile-guided build (PGO=1, the default) with the saved profile in pgo/ = the release binary.
+# The profile was recorded on 32-bit ARM running homebrew games only (2048, uCity), 3600 frames each.
+# GCC looks up DIR/<object's absolute path, '/' -> '#'>.gcda, so the files are copied under that name.
+# Needs the same compiler as the release (Debian gcc-arm-linux-gnueabi 14.2.0) for a byte-identical result.
+# PGO=0 = plain -O3 build (same picture and sound, about 10 % slower on the Explorer).
+PGOFLAGS=""
+if [ "${PGO:-1}" = 1 ] && [ -d "$W/pgo" ]; then
+  P="$OUT/pgo-use"; rm -rf "$P"; mkdir -p "$P"
+  M=$(printf '%s' "$W/src" | tr '/' '#')
+  for f in "$W"/pgo/*.gcda; do cp "$f" "$P/$M#$(basename "$f")"; done
+  PGOFLAGS="-fprofile-use=$P -fprofile-partial-training -Wno-missing-profile"
+fi
+CFLAGS="$ARCH ${OPT:--O3} -fno-strict-aliasing $PGOFLAGS -fno-pie -fcommon -std=gnu89 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-return-mismatch -nostdinc -isystem $GCCINC -isystem $SR/usr/include/$ML -isystem $SR/usr/include -I$SR/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT"
 LIBDIRS="-L$SR/lib/$ML -L$SR/usr/lib/$ML -L$GCCLIB -Wl,-rpath-link,$SR/lib/$ML:$SR/usr/lib/$ML"
 STARTS="$SR/usr/lib/$ML/crt1.o $SR/usr/lib/$ML/crti.o $GCCLIB/crtbegin.o"
 ENDS="$GCCLIB/crtend.o $SR/usr/lib/$ML/crtn.o"
